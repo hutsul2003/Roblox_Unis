@@ -128,73 +128,68 @@ local CHASE_STOP_DISTANCE = 5
 local MOVE_SPEED = 10
 local RUN_SPEED_MULTIPLIER = 1.5
 
--- Общая навигация для всех наземных NPC: вместо прямого бега в стену
--- строим маршрут через PathfindingService и двигаемся по точкам пути.
-local USE_PATHFINDING = true
-local PATH_AGENT_RADIUS = 2.2
-local PATH_AGENT_HEIGHT = 5
-local PATH_AGENT_CAN_JUMP = true
-local PATH_AGENT_CAN_CLIMB = false
-local PATH_WAYPOINT_SPACING = 4
-local PATH_RECOMPUTE_INTERVAL = 1.35
-local PATH_TARGET_MOVE_THRESHOLD = 8
-local PATH_WAYPOINT_REACHED_DISTANCE = 2.75
-local PATH_STUCK_DISTANCE = 0.65
-local PATH_STUCK_TIME = 1.6
+-- Общие настройки AI держим в одной таблице, а не в десятках local-переменных.
+-- Иначе Roblox упирается в лимит 200 local registers и Script вообще не стартует.
+local AI_CONFIG = {
+	-- PathfindingService: вместо прямого бега в стену строим маршрут по точкам.
+	USE_PATHFINDING = true,
+	PATH_AGENT_RADIUS = 2.2,
+	PATH_AGENT_HEIGHT = 5,
+	PATH_AGENT_CAN_JUMP = true,
+	PATH_AGENT_CAN_CLIMB = false,
+	PATH_WAYPOINT_SPACING = 4,
+	PATH_RECOMPUTE_INTERVAL = 1.35,
+	PATH_TARGET_MOVE_THRESHOLD = 8,
+	PATH_WAYPOINT_REACHED_DISTANCE = 2.75,
+	PATH_STUCK_DISTANCE = 0.65,
+	PATH_STUCK_TIME = 1.6,
 
--- Дополнительная «задумчивость»: если впереди препятствие, NPC выбирает
--- сторону обхода и держит её минимум это время, чтобы не метаться влево/вправо.
-local AVOIDANCE_SCAN_DISTANCE = 7
-local AVOIDANCE_SCAN_HEIGHT = 2.2
-local AVOIDANCE_SIDE_WEIGHT = 0.9
-local AVOIDANCE_DECISION_INTERVAL = 1.25
-local AVOIDANCE_COMMIT_TIME = 1.7
-local AVOIDANCE_POINT_REACHED_DISTANCE = 2.35
-local AVOIDANCE_FORWARD_CLEARANCE = 4
-local AVOIDANCE_SIDE_MARGIN = 4.5
-local AVOIDANCE_MIN_SIDE_CLEARANCE = 5.5
-local AVOIDANCE_MAX_SIDE_CLEARANCE = 12
+	-- Обход: выбираем сторону и держим решение, чтобы не метаться.
+	AVOIDANCE_SCAN_DISTANCE = 7,
+	AVOIDANCE_SCAN_HEIGHT = 2.2,
+	AVOIDANCE_SIDE_WEIGHT = 0.9,
+	AVOIDANCE_DECISION_INTERVAL = 1.25,
+	AVOIDANCE_COMMIT_TIME = 1.7,
+	AVOIDANCE_POINT_REACHED_DISTANCE = 2.35,
+	AVOIDANCE_FORWARD_CLEARANCE = 4,
+	AVOIDANCE_SIDE_MARGIN = 4.5,
+	AVOIDANCE_MIN_SIDE_CLEARANCE = 5.5,
+	AVOIDANCE_MAX_SIDE_CLEARANCE = 12,
 
--- Забор пират не обходит, а перелезает: 2 секунды анимации Climb,
--- подъём начинается на 0.3 секунде и поднимает модель на высоту забора (6 studs).
-local CLIMB_SCAN_DISTANCE = 5
-local CLIMB_SCAN_HEIGHT = 2.4
-local CLIMB_HEIGHT = 6
-local CLIMB_TOTAL_DURATION = 2
-local CLIMB_ASCEND_DELAY = 0.3
-local CLIMB_COOLDOWN = 1.25
-local CLIMB_MIN_OBSTACLE_HEIGHT = 3.5
-local CLIMB_MAX_OBSTACLE_HEIGHT = 7.5
+	-- Забор: перелезание за 2 секунды, подъём начинается через 0.3 сек.
+	CLIMB_SCAN_DISTANCE = 5,
+	CLIMB_SCAN_HEIGHT = 2.4,
+	CLIMB_HEIGHT = 6,
+	CLIMB_TOTAL_DURATION = 2,
+	CLIMB_ASCEND_DELAY = 0.3,
+	CLIMB_COOLDOWN = 1.25,
+	CLIMB_MIN_OBSTACLE_HEIGHT = 3.5,
+	CLIMB_MAX_OBSTACLE_HEIGHT = 7.5,
 
--- Прыжок нужен для камней/низких препятствий, когда NPC видит цель за ними
--- и должен перепрыгнуть, как обычный Roblox NPC. Анимация Jump необязательна:
--- когда добавишь её в модель, скрипт начнёт проигрывать её автоматически.
-local JUMP_SCAN_DISTANCE = 5.5
-local JUMP_SCAN_HEIGHT = 1.35
-local JUMP_MIN_OBSTACLE_HEIGHT = 0.45
-local JUMP_MAX_OBSTACLE_HEIGHT = 5.5
-local JUMP_COOLDOWN = 1.15
-local JUMP_DURATION = 0.78
-local JUMP_VERTICAL_SPEED = 42
-local JUMP_FORWARD_SPEED_MULTIPLIER = 1.15
-local JUMP_GROUND_GRACE = 0.35
+	-- Прыжок: механика работает даже без Jump-анимации.
+	JUMP_SCAN_DISTANCE = 5.5,
+	JUMP_SCAN_HEIGHT = 1.35,
+	JUMP_MIN_OBSTACLE_HEIGHT = 0.45,
+	JUMP_MAX_OBSTACLE_HEIGHT = 5.5,
+	JUMP_COOLDOWN = 1.15,
+	JUMP_DURATION = 0.78,
+	JUMP_VERTICAL_SPEED = 42,
+	JUMP_FORWARD_SPEED_MULTIPLIER = 1.15,
+	JUMP_GROUND_GRACE = 0.35,
 
--- Ограничиваем скорость разворота, чтобы NPC не дёргался при смене решения.
-local ROTATION_TURN_SPEED_DEGREES = 220
-local ROTATION_MIN_STEP_DELTA = 1 / 120
-local ROTATION_MAX_STEP_DELTA = 1 / 30
+	-- Плавный разворот.
+	ROTATION_TURN_SPEED_DEGREES = 220,
+	ROTATION_MIN_STEP_DELTA = 1 / 120,
+	ROTATION_MAX_STEP_DELTA = 1 / 30,
+
+	USE_LINE_OF_SIGHT = false,
+	FORCE_DIRECT_ROTATION = true,
+}
 
 local ATTACK_RANGE = 4.2
 local ATTACK_COOLDOWN = 1.4
 local ATTACK_DAMAGE = 20
 local ATTACK_HIT_DELAY = 0.35
-
--- Для теста лучше false.
--- Если true, пират будет проверять стены Raycast'ом.
-local USE_LINE_OF_SIGHT = false
-
--- Если true, скрипт напрямую разворачивает TorsoCollider через CFrame.
-local FORCE_DIRECT_ROTATION = true
 
 --====================================================
 -- COLLISION GROUPS
@@ -1011,14 +1006,14 @@ end
 
 local function getSteppedYaw(targetYaw)
 	local now = os.clock()
-	local deltaTime = math.clamp(now - lastFaceTowardsTime, ROTATION_MIN_STEP_DELTA, ROTATION_MAX_STEP_DELTA)
+	local deltaTime = math.clamp(now - lastFaceTowardsTime, AI_CONFIG.ROTATION_MIN_STEP_DELTA, AI_CONFIG.ROTATION_MAX_STEP_DELTA)
 	lastFaceTowardsTime = now
 
 	local _, actualYaw, _ = rootCollider.CFrame:ToOrientation()
 	currentSmoothedYaw = currentSmoothedYaw or actualYaw
 
 	local delta = getShortestAngleDelta(currentSmoothedYaw, targetYaw)
-	local maxStep = math.rad(ROTATION_TURN_SPEED_DEGREES) * deltaTime
+	local maxStep = math.rad(AI_CONFIG.ROTATION_TURN_SPEED_DEGREES) * deltaTime
 
 	if math.abs(delta) <= maxStep then
 		currentSmoothedYaw = targetYaw
@@ -1053,7 +1048,7 @@ local function faceTowards(targetPosition)
 
 	alignOrientation.CFrame = CFrame.Angles(0, steppedYaw, 0)
 
-	if FORCE_DIRECT_ROTATION then
+	if AI_CONFIG.FORCE_DIRECT_ROTATION then
 		local position = rootCollider.Position
 		local velocity = rootCollider.AssemblyLinearVelocity
 
@@ -1337,7 +1332,7 @@ local function isAliveCharacter(character)
 end
 
 local function hasLineOfSight(targetRoot)
-	if not USE_LINE_OF_SIGHT then
+	if not AI_CONFIG.USE_LINE_OF_SIGHT then
 		return true
 	end
 
@@ -1470,7 +1465,7 @@ local function raycastMovementObstacle(direction, distance, scanHeight)
 	end
 
 	updateMovementRaycastFilter()
-	local origin = rootCollider.Position + Vector3.new(0, scanHeight or AVOIDANCE_SCAN_HEIGHT, 0)
+	local origin = rootCollider.Position + Vector3.new(0, scanHeight or AI_CONFIG.AVOIDANCE_SCAN_HEIGHT, 0)
 	return workspace:Raycast(origin, direction.Unit * distance, movementRaycastParams)
 end
 
@@ -1508,13 +1503,13 @@ local function isClimbableFenceHit(result)
 	local thickness = math.min(part.Size.X, part.Size.Z)
 
 	if objectNameContains(part, explicitFenceKeywords) then
-		return height >= CLIMB_MIN_OBSTACLE_HEIGHT and height <= CLIMB_MAX_OBSTACLE_HEIGHT
+		return height >= AI_CONFIG.CLIMB_MIN_OBSTACLE_HEIGHT and height <= AI_CONFIG.CLIMB_MAX_OBSTACLE_HEIGHT
 	end
 
 	-- У декоративных заборов части не всегда названы Fence, поэтому допускаем
 	-- тонкие вертикальные препятствия высотой примерно с палисад/забор.
-	return height >= CLIMB_MIN_OBSTACLE_HEIGHT
-		and height <= CLIMB_MAX_OBSTACLE_HEIGHT
+	return height >= AI_CONFIG.CLIMB_MIN_OBSTACLE_HEIGHT
+		and height <= AI_CONFIG.CLIMB_MAX_OBSTACLE_HEIGHT
 		and thickness <= 2.8
 		and math.abs(result.Normal.Y) < 0.45
 end
@@ -1527,19 +1522,19 @@ local function updateClimbMotion()
 	local elapsed = os.clock() - climbStartTime
 	local climbProgress = 0
 
-	if elapsed > CLIMB_ASCEND_DELAY then
+	if elapsed > AI_CONFIG.CLIMB_ASCEND_DELAY then
 		climbProgress = math.clamp(
-			(elapsed - CLIMB_ASCEND_DELAY) / (CLIMB_TOTAL_DURATION - CLIMB_ASCEND_DELAY),
+			(elapsed - AI_CONFIG.CLIMB_ASCEND_DELAY) / (AI_CONFIG.CLIMB_TOTAL_DURATION - AI_CONFIG.CLIMB_ASCEND_DELAY),
 			0,
 			1
 		)
 	end
 
-	rootCollider.CFrame = climbStartCFrame + Vector3.new(0, CLIMB_HEIGHT * climbProgress, 0)
+	rootCollider.CFrame = climbStartCFrame + Vector3.new(0, AI_CONFIG.CLIMB_HEIGHT * climbProgress, 0)
 	rootCollider.AssemblyLinearVelocity = Vector3.zero
 	rootCollider.AssemblyAngularVelocity = Vector3.zero
 
-	if elapsed >= CLIMB_TOTAL_DURATION then
+	if elapsed >= AI_CONFIG.CLIMB_TOTAL_DURATION then
 		isClimbing = false
 		climbStartCFrame = nil
 		lastClimbTime = os.clock()
@@ -1553,11 +1548,11 @@ local function updateClimbMotion()
 end
 
 local function tryStartClimb(direction)
-	if isClimbing or isJumping or os.clock() - lastClimbTime < CLIMB_COOLDOWN then
+	if isClimbing or isJumping or os.clock() - lastClimbTime < AI_CONFIG.CLIMB_COOLDOWN then
 		return false
 	end
 
-	local result = raycastMovementObstacle(direction, CLIMB_SCAN_DISTANCE, CLIMB_SCAN_HEIGHT)
+	local result = raycastMovementObstacle(direction, AI_CONFIG.CLIMB_SCAN_DISTANCE, AI_CONFIG.CLIMB_SCAN_HEIGHT)
 
 	if not isClimbableFenceHit(result) then
 		return false
@@ -1588,8 +1583,8 @@ local function isJumpableObstacleHit(result)
 	local part = result.Instance
 	local height = part.Size.Y
 
-	return height >= JUMP_MIN_OBSTACLE_HEIGHT
-		and height <= JUMP_MAX_OBSTACLE_HEIGHT
+	return height >= AI_CONFIG.JUMP_MIN_OBSTACLE_HEIGHT
+		and height <= AI_CONFIG.JUMP_MAX_OBSTACLE_HEIGHT
 		and math.abs(result.Normal.Y) < 0.65
 end
 
@@ -1599,7 +1594,7 @@ local function startJump(direction, speed)
 	end
 
 	local now = os.clock()
-	if isJumping or isClimbing or now - lastJumpTime < JUMP_COOLDOWN then
+	if isJumping or isClimbing or now - lastJumpTime < AI_CONFIG.JUMP_COOLDOWN then
 		return false
 	end
 
@@ -1607,8 +1602,8 @@ local function startJump(direction, speed)
 	isJumping = true
 	jumpStartTime = now
 	jumpDirection = Vector3.new(direction.X, 0, direction.Z).Unit
-	jumpMoveSpeed = speed * JUMP_FORWARD_SPEED_MULTIPLIER
-	jumpGroundGraceUntil = now + JUMP_DURATION + JUMP_GROUND_GRACE
+	jumpMoveSpeed = speed * AI_CONFIG.JUMP_FORWARD_SPEED_MULTIPLIER
+	jumpGroundGraceUntil = now + AI_CONFIG.JUMP_DURATION + AI_CONFIG.JUMP_GROUND_GRACE
 	avoidancePoint = nil
 	avoidancePointExpiresAt = 0
 	forcePathRecompute = true
@@ -1618,7 +1613,7 @@ local function startJump(direction, speed)
 
 	rootCollider.AssemblyLinearVelocity = Vector3.new(
 		jumpDirection.X * jumpMoveSpeed,
-		JUMP_VERTICAL_SPEED,
+		AI_CONFIG.JUMP_VERTICAL_SPEED,
 		jumpDirection.Z * jumpMoveSpeed
 	)
 	rootCollider.AssemblyAngularVelocity = Vector3.zero
@@ -1632,7 +1627,7 @@ local function tryStartJump(direction, speed, forceJump)
 	end
 
 	if not forceJump then
-		local result = raycastMovementObstacle(direction, JUMP_SCAN_DISTANCE, JUMP_SCAN_HEIGHT)
+		local result = raycastMovementObstacle(direction, AI_CONFIG.JUMP_SCAN_DISTANCE, AI_CONFIG.JUMP_SCAN_HEIGHT)
 		if not isJumpableObstacleHit(result) then
 			return false
 		end
@@ -1654,7 +1649,7 @@ local function updateJumpMotion()
 		jumpDirection.Z * jumpMoveSpeed
 	)
 
-	if elapsed >= JUMP_DURATION then
+	if elapsed >= AI_CONFIG.JUMP_DURATION then
 		isJumping = false
 		forcePathRecompute = true
 		lastPathMovePosition = rootCollider.Position
@@ -1703,7 +1698,7 @@ clearPath = function()
 end
 
 local function shouldRecomputePath(targetPosition)
-	local canRecomputeNow = os.clock() - lastPathComputeTime >= PATH_RECOMPUTE_INTERVAL
+	local canRecomputeNow = os.clock() - lastPathComputeTime >= AI_CONFIG.PATH_RECOMPUTE_INTERVAL
 
 	if not currentPath or #currentWaypoints == 0 or not currentPathTargetPosition then
 		return canRecomputeNow
@@ -1717,7 +1712,7 @@ local function shouldRecomputePath(targetPosition)
 		return canRecomputeNow
 	end
 
-	if (targetPosition - currentPathTargetPosition).Magnitude >= PATH_TARGET_MOVE_THRESHOLD then
+	if (targetPosition - currentPathTargetPosition).Magnitude >= AI_CONFIG.PATH_TARGET_MOVE_THRESHOLD then
 		return canRecomputeNow
 	end
 
@@ -1725,7 +1720,7 @@ local function shouldRecomputePath(targetPosition)
 end
 
 local function computePathTo(targetPosition)
-	if not USE_PATHFINDING then
+	if not AI_CONFIG.USE_PATHFINDING then
 		return false
 	end
 
@@ -1742,11 +1737,11 @@ local function computePathTo(targetPosition)
 	end
 
 	local path = PathfindingService:CreatePath({
-		AgentRadius = PATH_AGENT_RADIUS,
-		AgentHeight = PATH_AGENT_HEIGHT,
-		AgentCanJump = PATH_AGENT_CAN_JUMP,
-		AgentCanClimb = PATH_AGENT_CAN_CLIMB,
-		WaypointSpacing = PATH_WAYPOINT_SPACING,
+		AgentRadius = AI_CONFIG.PATH_AGENT_RADIUS,
+		AgentHeight = AI_CONFIG.PATH_AGENT_HEIGHT,
+		AgentCanJump = AI_CONFIG.PATH_AGENT_CAN_JUMP,
+		AgentCanClimb = AI_CONFIG.PATH_AGENT_CAN_CLIMB,
+		WaypointSpacing = AI_CONFIG.PATH_WAYPOINT_SPACING,
 	})
 
 	local ok, errorMessage = pcall(function()
@@ -1791,7 +1786,7 @@ local function getNextPathWaypoint(targetPosition)
 		local waypoint = currentWaypoints[currentWaypointIndex]
 		local flatWaypoint = Vector3.new(waypoint.Position.X, rootCollider.Position.Y, waypoint.Position.Z)
 
-		if (flatWaypoint - rootCollider.Position).Magnitude > PATH_WAYPOINT_REACHED_DISTANCE then
+		if (flatWaypoint - rootCollider.Position).Magnitude > AI_CONFIG.PATH_WAYPOINT_REACHED_DISTANCE then
 			currentWaypointAction = waypoint.Action
 			return waypoint.Position
 		end
@@ -1808,13 +1803,13 @@ local function updatePathStuckDetector()
 	local flatCurrent = Vector3.new(rootCollider.Position.X, 0, rootCollider.Position.Z)
 	local flatLast = Vector3.new(lastPathMovePosition.X, 0, lastPathMovePosition.Z)
 
-	if (flatCurrent - flatLast).Magnitude >= PATH_STUCK_DISTANCE then
+	if (flatCurrent - flatLast).Magnitude >= AI_CONFIG.PATH_STUCK_DISTANCE then
 		lastPathMovePosition = rootCollider.Position
 		lastPathMoveTime = now
 		return
 	end
 
-	if now - lastPathMoveTime >= PATH_STUCK_TIME then
+	if now - lastPathMoveTime >= AI_CONFIG.PATH_STUCK_TIME then
 		forcePathRecompute = true
 		lastPathMovePosition = rootCollider.Position
 		lastPathMoveTime = now
@@ -1822,13 +1817,13 @@ local function updatePathStuckDetector()
 end
 
 local function getClearDistance(direction)
-	local result = raycastMovementObstacle(direction, AVOIDANCE_SCAN_DISTANCE)
+	local result = raycastMovementObstacle(direction, AI_CONFIG.AVOIDANCE_SCAN_DISTANCE)
 
 	if not result then
-		return AVOIDANCE_SCAN_DISTANCE
+		return AI_CONFIG.AVOIDANCE_SCAN_DISTANCE
 	end
 
-	return (result.Position - (rootCollider.Position + Vector3.new(0, AVOIDANCE_SCAN_HEIGHT, 0))).Magnitude
+	return (result.Position - (rootCollider.Position + Vector3.new(0, AI_CONFIG.AVOIDANCE_SCAN_HEIGHT, 0))).Magnitude
 end
 
 local function getFlatDistance(a, b)
@@ -1837,7 +1832,7 @@ end
 
 local function getObstacleSideClearance(result, sideVector)
 	if not result or not result.Instance or not result.Instance:IsA("BasePart") then
-		return AVOIDANCE_MIN_SIDE_CLEARANCE
+		return AI_CONFIG.AVOIDANCE_MIN_SIDE_CLEARANCE
 	end
 
 	local part = result.Instance
@@ -1847,7 +1842,7 @@ local function getObstacleSideClearance(result, sideVector)
 		+ math.abs(sideVector:Dot(partCFrame.UpVector)) * halfSize.Y
 		+ math.abs(sideVector:Dot(partCFrame.LookVector)) * halfSize.Z
 
-	return math.clamp(sideExtent + AVOIDANCE_SIDE_MARGIN, AVOIDANCE_MIN_SIDE_CLEARANCE, AVOIDANCE_MAX_SIDE_CLEARANCE)
+	return math.clamp(sideExtent + AI_CONFIG.AVOIDANCE_SIDE_MARGIN, AI_CONFIG.AVOIDANCE_MIN_SIDE_CLEARANCE, AI_CONFIG.AVOIDANCE_MAX_SIDE_CLEARANCE)
 end
 
 local function chooseAvoidanceSide(direction)
@@ -1855,12 +1850,12 @@ local function chooseAvoidanceSide(direction)
 	local left = Vector3.new(-direction.Z, 0, direction.X).Unit
 	local right = Vector3.new(direction.Z, 0, -direction.X).Unit
 
-	if avoidanceSide ~= 0 and now - lastAvoidanceDecisionTime < AVOIDANCE_DECISION_INTERVAL then
+	if avoidanceSide ~= 0 and now - lastAvoidanceDecisionTime < AI_CONFIG.AVOIDANCE_DECISION_INTERVAL then
 		return avoidanceSide, (avoidanceSide == 1) and left or right
 	end
 
-	local leftDiagonal = getClearDistance((direction + left * AVOIDANCE_SIDE_WEIGHT).Unit)
-	local rightDiagonal = getClearDistance((direction + right * AVOIDANCE_SIDE_WEIGHT).Unit)
+	local leftDiagonal = getClearDistance((direction + left * AI_CONFIG.AVOIDANCE_SIDE_WEIGHT).Unit)
+	local rightDiagonal = getClearDistance((direction + right * AI_CONFIG.AVOIDANCE_SIDE_WEIGHT).Unit)
 	local leftSide = getClearDistance(left)
 	local rightSide = getClearDistance(right)
 	local leftScore = leftDiagonal + leftSide * 0.75
@@ -1877,7 +1872,7 @@ local function getAvoidanceMoveTarget(direction, defaultTargetPosition)
 	local currentPosition = rootCollider.Position
 
 	if avoidancePoint and now < avoidancePointExpiresAt then
-		if getFlatDistance(currentPosition, avoidancePoint) > AVOIDANCE_POINT_REACHED_DISTANCE then
+		if getFlatDistance(currentPosition, avoidancePoint) > AI_CONFIG.AVOIDANCE_POINT_REACHED_DISTANCE then
 			return avoidancePoint
 		end
 
@@ -1885,7 +1880,7 @@ local function getAvoidanceMoveTarget(direction, defaultTargetPosition)
 		avoidancePointExpiresAt = 0
 	end
 
-	local frontHit = raycastMovementObstacle(direction, AVOIDANCE_SCAN_DISTANCE)
+	local frontHit = raycastMovementObstacle(direction, AI_CONFIG.AVOIDANCE_SCAN_DISTANCE)
 
 	if not frontHit or isClimbableFenceHit(frontHit) then
 		avoidanceSide = 0
@@ -1902,8 +1897,8 @@ local function getAvoidanceMoveTarget(direction, defaultTargetPosition)
 	-- сначала вышел вбок от камня/стены, а не пытался пройти сквозь её край.
 	avoidancePoint = currentPosition
 		+ sideVector * sideClearance
-		+ direction * AVOIDANCE_FORWARD_CLEARANCE
-	avoidancePointExpiresAt = now + AVOIDANCE_COMMIT_TIME
+		+ direction * AI_CONFIG.AVOIDANCE_FORWARD_CLEARANCE
+	avoidancePointExpiresAt = now + AI_CONFIG.AVOIDANCE_COMMIT_TIME
 	forcePathRecompute = true
 
 	return avoidancePoint
