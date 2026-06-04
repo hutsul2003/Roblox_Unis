@@ -1,5 +1,6 @@
 local RunService = game:GetService("RunService")
 local PhysicsService = game:GetService("PhysicsService")
+local PathfindingService = game:GetService("PathfindingService")
 local Players = game:GetService("Players")
 local CollectionService = game:GetService("CollectionService")
 
@@ -16,6 +17,8 @@ local IDLE_ANIMATION_NAME = "Idle"
 local WALK_ANIMATION_NAME = "Walk"
 local RUN_ANIMATION_NAME = "Run"
 local ATTACK_ANIMATION_NAME = "Attack"
+local CLIMB_ANIMATION_NAME = "Climb"
+local JUMP_ANIMATION_NAME = "Jump"
 
 local ROOT_COLLIDER_NAME = "TorsoCollider"
 
@@ -28,6 +31,84 @@ local DEBUG_VISIBLE = false
 
 -- Если пират идёт спиной к игроку, пробуй 0 / 90 / -90 / 180
 local MODEL_YAW_OFFSET_DEGREES = 180
+
+--====================================================
+-- РАННЯЯ СБОРКА КОЛЛАЙДЕРОВ
+--====================================================
+-- Если ниже в AI появится ошибка, NPC всё равно не должен «разваливаться»:
+-- сначала прячем BodyColliders и привариваем их к TorsoCollider/визуалу.
+-- Основной физический блок ниже повторно настроит эти weld'ы уже полностью.
+local function bootstrapColliderWelds()
+	local bootstrapBodyColliders = npc:FindFirstChild(BODY_COLLIDERS_NAME)
+	local bootstrapVisualMesh = npc:FindFirstChild(VISUAL_MESH_NAME, true)
+
+	if not bootstrapBodyColliders then
+		return
+	end
+
+	local bootstrapRootCollider = bootstrapBodyColliders:FindFirstChild(ROOT_COLLIDER_NAME, true)
+
+	if not bootstrapRootCollider or not bootstrapRootCollider:IsA("BasePart") then
+		return
+	end
+
+	for _, object in ipairs(bootstrapBodyColliders:GetDescendants()) do
+		if object:IsA("BasePart") then
+			object.Anchored = true
+		end
+	end
+
+	if bootstrapVisualMesh and bootstrapVisualMesh:IsA("BasePart") then
+		bootstrapVisualMesh.Anchored = true
+	end
+
+	for _, object in ipairs(npc:GetDescendants()) do
+		if object:IsA("WeldConstraint") then
+			if object.Name == "PirateColliderWeld" or object.Name == "PirateVisualWeld" then
+				object:Destroy()
+			end
+		end
+	end
+
+	for _, object in ipairs(bootstrapBodyColliders:GetDescendants()) do
+		if object:IsA("BasePart") then
+			object.CanQuery = true
+			object.Transparency = DEBUG_VISIBLE and 0.45 or 1
+
+			if object ~= bootstrapRootCollider then
+				local weld = Instance.new("WeldConstraint")
+				weld.Name = "PirateColliderWeld"
+				weld.Part0 = bootstrapRootCollider
+				weld.Part1 = object
+				weld.Parent = object
+			end
+		end
+	end
+
+	if bootstrapVisualMesh and bootstrapVisualMesh:IsA("BasePart") then
+		bootstrapVisualMesh.CanCollide = false
+		bootstrapVisualMesh.CanTouch = false
+		bootstrapVisualMesh.Massless = true
+
+		local visualWeld = Instance.new("WeldConstraint")
+		visualWeld.Name = "PirateVisualWeld"
+		visualWeld.Part0 = bootstrapRootCollider
+		visualWeld.Part1 = bootstrapVisualMesh
+		visualWeld.Parent = bootstrapRootCollider
+	end
+
+	for _, object in ipairs(bootstrapBodyColliders:GetDescendants()) do
+		if object:IsA("BasePart") then
+			object.Anchored = false
+		end
+	end
+
+	if bootstrapVisualMesh and bootstrapVisualMesh:IsA("BasePart") then
+		bootstrapVisualMesh.Anchored = false
+	end
+end
+
+bootstrapColliderWelds()
 
 --====================================================
 -- НАСТРОЙКИ ИИ
@@ -47,17 +128,68 @@ local CHASE_STOP_DISTANCE = 5
 local MOVE_SPEED = 10
 local RUN_SPEED_MULTIPLIER = 1.5
 
+-- Общие настройки AI держим в одной таблице, а не в десятках local-переменных.
+-- Иначе Roblox упирается в лимит 200 local registers и Script вообще не стартует.
+local AI_CONFIG = {
+	-- PathfindingService: вместо прямого бега в стену строим маршрут по точкам.
+	USE_PATHFINDING = true,
+	PATH_AGENT_RADIUS = 2.2,
+	PATH_AGENT_HEIGHT = 5,
+	PATH_AGENT_CAN_JUMP = true,
+	PATH_AGENT_CAN_CLIMB = false,
+	PATH_WAYPOINT_SPACING = 4,
+	PATH_RECOMPUTE_INTERVAL = 1.35,
+	PATH_TARGET_MOVE_THRESHOLD = 8,
+	PATH_WAYPOINT_REACHED_DISTANCE = 2.75,
+	PATH_STUCK_DISTANCE = 0.65,
+	PATH_STUCK_TIME = 1.6,
+
+	-- Обход: выбираем сторону и держим решение, чтобы не метаться.
+	AVOIDANCE_SCAN_DISTANCE = 7,
+	AVOIDANCE_SCAN_HEIGHT = 2.2,
+	AVOIDANCE_SIDE_WEIGHT = 0.9,
+	AVOIDANCE_DECISION_INTERVAL = 1.25,
+	AVOIDANCE_COMMIT_TIME = 1.7,
+	AVOIDANCE_POINT_REACHED_DISTANCE = 2.35,
+	AVOIDANCE_FORWARD_CLEARANCE = 4,
+	AVOIDANCE_SIDE_MARGIN = 4.5,
+	AVOIDANCE_MIN_SIDE_CLEARANCE = 5.5,
+	AVOIDANCE_MAX_SIDE_CLEARANCE = 12,
+
+	-- Забор: перелезание за 2 секунды, подъём начинается через 0.3 сек.
+	CLIMB_SCAN_DISTANCE = 5,
+	CLIMB_SCAN_HEIGHT = 2.4,
+	CLIMB_HEIGHT = 6,
+	CLIMB_TOTAL_DURATION = 2,
+	CLIMB_ASCEND_DELAY = 0.3,
+	CLIMB_COOLDOWN = 1.25,
+	CLIMB_MIN_OBSTACLE_HEIGHT = 3.5,
+	CLIMB_MAX_OBSTACLE_HEIGHT = 7.5,
+
+	-- Прыжок: механика работает даже без Jump-анимации.
+	JUMP_SCAN_DISTANCE = 5.5,
+	JUMP_SCAN_HEIGHT = 1.35,
+	JUMP_MIN_OBSTACLE_HEIGHT = 0.45,
+	JUMP_MAX_OBSTACLE_HEIGHT = 5.5,
+	JUMP_COOLDOWN = 1.15,
+	JUMP_DURATION = 0.78,
+	JUMP_VERTICAL_SPEED = 42,
+	JUMP_FORWARD_SPEED_MULTIPLIER = 1.15,
+	JUMP_GROUND_GRACE = 0.35,
+
+	-- Плавный разворот.
+	ROTATION_TURN_SPEED_DEGREES = 220,
+	ROTATION_MIN_STEP_DELTA = 1 / 120,
+	ROTATION_MAX_STEP_DELTA = 1 / 30,
+
+	USE_LINE_OF_SIGHT = false,
+	FORCE_DIRECT_ROTATION = true,
+}
+
 local ATTACK_RANGE = 4.2
 local ATTACK_COOLDOWN = 1.4
 local ATTACK_DAMAGE = 20
 local ATTACK_HIT_DELAY = 0.35
-
--- Для теста лучше false.
--- Если true, пират будет проверять стены Raycast'ом.
-local USE_LINE_OF_SIGHT = false
-
--- Если true, скрипт напрямую разворачивает TorsoCollider через CFrame.
-local FORCE_DIRECT_ROTATION = true
 
 --====================================================
 -- COLLISION GROUPS
@@ -603,6 +735,18 @@ end
 -- ФИЗИКА NPC
 --====================================================
 
+-- Пересобираем weld'ы атомарно: сначала временно закрепляем части,
+-- чтобы они не успевали физически разлететься при удалении старых weld'ов.
+for _, object in ipairs(bodyColliders:GetDescendants()) do
+	if object:IsA("BasePart") then
+		object.Anchored = true
+	end
+end
+
+if visualMesh then
+	visualMesh.Anchored = true
+end
+
 for _, object in ipairs(npc:GetDescendants()) do
 	if object:IsA("WeldConstraint") then
 		if object.Name == "PirateColliderWeld" or object.Name == "PirateVisualWeld" then
@@ -782,6 +926,7 @@ end
 -- Если ноги поднялись выше нормальной высоты больше чем на столько —
 -- считаем это баг-подбросом и жёстко возвращаем NPC к земле.
 local MAX_HOVER_ABOVE_GROUND = 2.5
+local limitUpwardLaunch
 
 local function stabilizeOnGround()
 	local legBottomY = getLegBottomY()
@@ -816,7 +961,7 @@ local function stabilizeOnGround()
 	end
 end
 
-local function limitUpwardLaunch()
+limitUpwardLaunch = function()
 	local velocity = rootCollider.AssemblyLinearVelocity
 
 	if velocity.Y <= MAX_UPWARD_VELOCITY then
@@ -852,6 +997,32 @@ if not alignOrientation then
 end
 
 local desiredYaw = 0
+local currentSmoothedYaw = nil
+local lastFaceTowardsTime = os.clock()
+
+local function getShortestAngleDelta(fromYaw, toYaw)
+	return math.atan2(math.sin(toYaw - fromYaw), math.cos(toYaw - fromYaw))
+end
+
+local function getSteppedYaw(targetYaw)
+	local now = os.clock()
+	local deltaTime = math.clamp(now - lastFaceTowardsTime, AI_CONFIG.ROTATION_MIN_STEP_DELTA, AI_CONFIG.ROTATION_MAX_STEP_DELTA)
+	lastFaceTowardsTime = now
+
+	local _, actualYaw, _ = rootCollider.CFrame:ToOrientation()
+	currentSmoothedYaw = currentSmoothedYaw or actualYaw
+
+	local delta = getShortestAngleDelta(currentSmoothedYaw, targetYaw)
+	local maxStep = math.rad(AI_CONFIG.ROTATION_TURN_SPEED_DEGREES) * deltaTime
+
+	if math.abs(delta) <= maxStep then
+		currentSmoothedYaw = targetYaw
+	else
+		currentSmoothedYaw = currentSmoothedYaw + ((delta >= 0) and 1 or -1) * maxStep
+	end
+
+	return currentSmoothedYaw
+end
 
 local function getYawFacingPosition(targetPosition)
 	local currentPosition = rootCollider.Position
@@ -866,21 +1037,22 @@ local function getYawFacingPosition(targetPosition)
 	local lookCFrame = CFrame.lookAt(currentPosition, flatTarget)
 	local _, yaw, _ = lookCFrame:ToOrientation()
 
-	yaw += math.rad(MODEL_YAW_OFFSET_DEGREES)
+	yaw = yaw + math.rad(MODEL_YAW_OFFSET_DEGREES)
 
 	return yaw
 end
 
 local function faceTowards(targetPosition)
 	desiredYaw = getYawFacingPosition(targetPosition)
+	local steppedYaw = getSteppedYaw(desiredYaw)
 
-	alignOrientation.CFrame = CFrame.Angles(0, desiredYaw, 0)
+	alignOrientation.CFrame = CFrame.Angles(0, steppedYaw, 0)
 
-	if FORCE_DIRECT_ROTATION then
+	if AI_CONFIG.FORCE_DIRECT_ROTATION then
 		local position = rootCollider.Position
 		local velocity = rootCollider.AssemblyLinearVelocity
 
-		rootCollider.CFrame = CFrame.new(position) * CFrame.Angles(0, desiredYaw, 0)
+		rootCollider.CFrame = CFrame.new(position) * CFrame.Angles(0, steppedYaw, 0)
 		rootCollider.AssemblyLinearVelocity = velocity
 		rootCollider.AssemblyAngularVelocity = Vector3.zero
 	end
@@ -912,6 +1084,8 @@ local idleAnimation = npc:FindFirstChild(IDLE_ANIMATION_NAME, true)
 local walkAnimation = npc:FindFirstChild(WALK_ANIMATION_NAME, true)
 local runAnimation = npc:FindFirstChild(RUN_ANIMATION_NAME, true)
 local attackAnimation = npc:FindFirstChild(ATTACK_ANIMATION_NAME, true)
+local climbAnimation = npc:FindFirstChild(CLIMB_ANIMATION_NAME, true)
+local jumpAnimation = npc:FindFirstChild(JUMP_ANIMATION_NAME, true)
 
 if not idleAnimation or not idleAnimation:IsA("Animation") then
 	warn("[PirateUnitAI] Idle animation not found")
@@ -933,6 +1107,8 @@ local walkTrack = animator:LoadAnimation(walkAnimation)
 local attackTrack = animator:LoadAnimation(attackAnimation)
 
 local runTrack = nil
+local climbTrack = nil
+local jumpTrack = nil
 
 if runAnimation and runAnimation:IsA("Animation") then
 	runTrack = animator:LoadAnimation(runAnimation)
@@ -941,15 +1117,41 @@ else
 	runTrack = walkTrack
 end
 
+if climbAnimation and climbAnimation:IsA("Animation") then
+	climbTrack = animator:LoadAnimation(climbAnimation)
+else
+	warn("[PirateUnitAI] Climb animation not found. Fence climbing will still move the NPC, but without the Climb track.")
+end
+
+if jumpAnimation and jumpAnimation:IsA("Animation") then
+	jumpTrack = animator:LoadAnimation(jumpAnimation)
+end
+
 idleTrack.Looped = true
 walkTrack.Looped = true
 runTrack.Looped = true
 attackTrack.Looped = false
 
+if climbTrack then
+	climbTrack.Looped = false
+end
+
+if jumpTrack then
+	jumpTrack.Looped = false
+end
+
 idleTrack.Priority = Enum.AnimationPriority.Idle
 walkTrack.Priority = Enum.AnimationPriority.Movement
 runTrack.Priority = Enum.AnimationPriority.Movement
 attackTrack.Priority = Enum.AnimationPriority.Action
+
+if climbTrack then
+	climbTrack.Priority = Enum.AnimationPriority.Action
+end
+
+if jumpTrack then
+	jumpTrack.Priority = Enum.AnimationPriority.Action
+end
 
 local currentAnimationState = nil
 
@@ -967,6 +1169,14 @@ local function playIdle()
 	end
 
 	attackTrack:Stop(0.1)
+
+	if climbTrack then
+		climbTrack:Stop(0.1)
+	end
+
+	if jumpTrack then
+		jumpTrack:Stop(0.1)
+	end
 
 	if not idleTrack.IsPlaying then
 		idleTrack:Play(0.2)
@@ -988,6 +1198,14 @@ local function playWalk()
 
 	attackTrack:Stop(0.1)
 
+	if climbTrack then
+		climbTrack:Stop(0.1)
+	end
+
+	if jumpTrack then
+		jumpTrack:Stop(0.1)
+	end
+
 	if not walkTrack.IsPlaying then
 		walkTrack:Play(0.2)
 	end
@@ -1004,6 +1222,14 @@ local function playRun()
 	walkTrack:Stop(0.15)
 	attackTrack:Stop(0.1)
 
+	if climbTrack then
+		climbTrack:Stop(0.1)
+	end
+
+	if jumpTrack then
+		jumpTrack:Stop(0.1)
+	end
+
 	if not runTrack.IsPlaying then
 		runTrack:Play(0.15)
 	end
@@ -1019,8 +1245,60 @@ local function playAttack()
 		runTrack:Stop(0.1)
 	end
 
+	if climbTrack then
+		climbTrack:Stop(0.05)
+	end
+
+	if jumpTrack then
+		jumpTrack:Stop(0.05)
+	end
+
 	attackTrack:Stop(0)
 	attackTrack:Play(0.05)
+end
+
+local function playClimb()
+	currentAnimationState = "Climb"
+
+	idleTrack:Stop(0.1)
+	walkTrack:Stop(0.1)
+
+	if runTrack ~= walkTrack then
+		runTrack:Stop(0.1)
+	end
+
+	attackTrack:Stop(0.05)
+
+	if jumpTrack then
+		jumpTrack:Stop(0.05)
+	end
+
+	if climbTrack then
+		climbTrack:Stop(0)
+		climbTrack:Play(0.05)
+	end
+end
+
+local function playJump()
+	currentAnimationState = "Jump"
+
+	idleTrack:Stop(0.1)
+	walkTrack:Stop(0.1)
+
+	if runTrack ~= walkTrack then
+		runTrack:Stop(0.1)
+	end
+
+	attackTrack:Stop(0.05)
+
+	if climbTrack then
+		climbTrack:Stop(0.05)
+	end
+
+	if jumpTrack then
+		jumpTrack:Stop(0)
+		jumpTrack:Play(0.05)
+	end
 end
 
 --====================================================
@@ -1054,7 +1332,7 @@ local function isAliveCharacter(character)
 end
 
 local function hasLineOfSight(targetRoot)
-	if not USE_LINE_OF_SIGHT then
+	if not AI_CONFIG.USE_LINE_OF_SIGHT then
 		return true
 	end
 
@@ -1127,6 +1405,23 @@ end
 
 local lastAttackTime = 0
 local isAttacking = false
+local isClimbing = false
+local climbStartTime = 0
+local climbStartCFrame = nil
+local lastClimbTime = -math.huge
+local climbGroundGraceUntil = 0
+local isJumping = false
+local jumpStartTime = 0
+local lastJumpTime = -math.huge
+local jumpDirection = Vector3.zero
+local jumpMoveSpeed = 0
+local jumpGroundGraceUntil = 0
+local clearPath
+local forcePathRecompute
+local lastPathMovePosition
+local lastPathMoveTime
+local avoidancePoint
+local avoidancePointExpiresAt
 
 local currentTargetCharacter = nil
 local isChasingEscapedTarget = false
@@ -1134,11 +1429,479 @@ local isChasingEscapedTarget = false
 local function clearTarget()
 	currentTargetCharacter = nil
 	isChasingEscapedTarget = false
+	clearPath()
 end
 
 local function stopMovement()
 	local velocity = rootCollider.AssemblyLinearVelocity
 	rootCollider.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+end
+
+local movementRaycastParams = RaycastParams.new()
+movementRaycastParams.FilterType = Enum.RaycastFilterType.Exclude
+movementRaycastParams.IgnoreWater = true
+
+local function updateMovementRaycastFilter()
+	local filterList = { npc }
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player.Character then
+			table.insert(filterList, player.Character)
+		end
+	end
+
+	for _, other in ipairs(CollectionService:GetTagged(UNIT_TAG)) do
+		if other ~= npc then
+			table.insert(filterList, other)
+		end
+	end
+
+	movementRaycastParams.FilterDescendantsInstances = filterList
+end
+
+local function raycastMovementObstacle(direction, distance, scanHeight)
+	if direction.Magnitude <= 0.05 then
+		return nil
+	end
+
+	updateMovementRaycastFilter()
+	local origin = rootCollider.Position + Vector3.new(0, scanHeight or AI_CONFIG.AVOIDANCE_SCAN_HEIGHT, 0)
+	return workspace:Raycast(origin, direction.Unit * distance, movementRaycastParams)
+end
+
+local function objectNameContains(object, keywords)
+	local current = object
+
+	while current and current ~= workspace do
+		local lowerName = string.lower(current.Name)
+
+		for _, keyword in ipairs(keywords) do
+			if string.find(lowerName, keyword, 1, true) then
+				return true
+			end
+		end
+
+		current = current.Parent
+	end
+
+	return false
+end
+
+local function isClimbableFenceHit(result)
+	if not result or not result.Instance or not result.Instance:IsA("BasePart") then
+		return false
+	end
+
+	local blockedKeywords = { "stone", "rock", "кам", "скал", "barrel", "torch", "tent" }
+	if objectNameContains(result.Instance, blockedKeywords) then
+		return false
+	end
+
+	local explicitFenceKeywords = { "fence", "забор", "palisade", "picket" }
+	local part = result.Instance
+	local height = part.Size.Y
+	local thickness = math.min(part.Size.X, part.Size.Z)
+
+	if objectNameContains(part, explicitFenceKeywords) then
+		return height >= AI_CONFIG.CLIMB_MIN_OBSTACLE_HEIGHT and height <= AI_CONFIG.CLIMB_MAX_OBSTACLE_HEIGHT
+	end
+
+	-- У декоративных заборов части не всегда названы Fence, поэтому допускаем
+	-- тонкие вертикальные препятствия высотой примерно с палисад/забор.
+	return height >= AI_CONFIG.CLIMB_MIN_OBSTACLE_HEIGHT
+		and height <= AI_CONFIG.CLIMB_MAX_OBSTACLE_HEIGHT
+		and thickness <= 2.8
+		and math.abs(result.Normal.Y) < 0.45
+end
+
+local function updateClimbMotion()
+	if not isClimbing or not climbStartCFrame then
+		return false
+	end
+
+	local elapsed = os.clock() - climbStartTime
+	local climbProgress = 0
+
+	if elapsed > AI_CONFIG.CLIMB_ASCEND_DELAY then
+		climbProgress = math.clamp(
+			(elapsed - AI_CONFIG.CLIMB_ASCEND_DELAY) / (AI_CONFIG.CLIMB_TOTAL_DURATION - AI_CONFIG.CLIMB_ASCEND_DELAY),
+			0,
+			1
+		)
+	end
+
+	rootCollider.CFrame = climbStartCFrame + Vector3.new(0, AI_CONFIG.CLIMB_HEIGHT * climbProgress, 0)
+	rootCollider.AssemblyLinearVelocity = Vector3.zero
+	rootCollider.AssemblyAngularVelocity = Vector3.zero
+
+	if elapsed >= AI_CONFIG.CLIMB_TOTAL_DURATION then
+		isClimbing = false
+		climbStartCFrame = nil
+		lastClimbTime = os.clock()
+		climbGroundGraceUntil = lastClimbTime + 1.2
+		forcePathRecompute = true
+		lastPathMovePosition = rootCollider.Position
+		lastPathMoveTime = os.clock()
+	end
+
+	return isClimbing
+end
+
+local function tryStartClimb(direction)
+	if isClimbing or isJumping or os.clock() - lastClimbTime < AI_CONFIG.CLIMB_COOLDOWN then
+		return false
+	end
+
+	local result = raycastMovementObstacle(direction, AI_CONFIG.CLIMB_SCAN_DISTANCE, AI_CONFIG.CLIMB_SCAN_HEIGHT)
+
+	if not isClimbableFenceHit(result) then
+		return false
+	end
+
+	lastClimbTime = os.clock()
+	isClimbing = true
+	climbStartTime = lastClimbTime
+	climbStartCFrame = rootCollider.CFrame
+
+	faceTowards(rootCollider.Position + direction.Unit)
+	clearPath()
+	stopMovement()
+	playClimb()
+
+	return true
+end
+
+local function isJumpableObstacleHit(result)
+	if not result or not result.Instance or not result.Instance:IsA("BasePart") then
+		return false
+	end
+
+	if isClimbableFenceHit(result) then
+		return false
+	end
+
+	local part = result.Instance
+	local height = part.Size.Y
+
+	return height >= AI_CONFIG.JUMP_MIN_OBSTACLE_HEIGHT
+		and height <= AI_CONFIG.JUMP_MAX_OBSTACLE_HEIGHT
+		and math.abs(result.Normal.Y) < 0.65
+end
+
+local function startJump(direction, speed)
+	if direction.Magnitude <= 0.05 then
+		return false
+	end
+
+	local now = os.clock()
+	if isJumping or isClimbing or now - lastJumpTime < AI_CONFIG.JUMP_COOLDOWN then
+		return false
+	end
+
+	lastJumpTime = now
+	isJumping = true
+	jumpStartTime = now
+	jumpDirection = Vector3.new(direction.X, 0, direction.Z).Unit
+	jumpMoveSpeed = speed * AI_CONFIG.JUMP_FORWARD_SPEED_MULTIPLIER
+	jumpGroundGraceUntil = now + AI_CONFIG.JUMP_DURATION + AI_CONFIG.JUMP_GROUND_GRACE
+	avoidancePoint = nil
+	avoidancePointExpiresAt = 0
+	forcePathRecompute = true
+
+	faceTowards(rootCollider.Position + jumpDirection)
+	playJump()
+
+	rootCollider.AssemblyLinearVelocity = Vector3.new(
+		jumpDirection.X * jumpMoveSpeed,
+		AI_CONFIG.JUMP_VERTICAL_SPEED,
+		jumpDirection.Z * jumpMoveSpeed
+	)
+	rootCollider.AssemblyAngularVelocity = Vector3.zero
+
+	return true
+end
+
+local function tryStartJump(direction, speed, forceJump)
+	if direction.Magnitude <= 0.05 then
+		return false
+	end
+
+	if not forceJump then
+		local result = raycastMovementObstacle(direction, AI_CONFIG.JUMP_SCAN_DISTANCE, AI_CONFIG.JUMP_SCAN_HEIGHT)
+		if not isJumpableObstacleHit(result) then
+			return false
+		end
+	end
+
+	return startJump(direction, speed)
+end
+
+local function updateJumpMotion()
+	if not isJumping then
+		return false
+	end
+
+	local elapsed = os.clock() - jumpStartTime
+	local velocity = rootCollider.AssemblyLinearVelocity
+	rootCollider.AssemblyLinearVelocity = Vector3.new(
+		jumpDirection.X * jumpMoveSpeed,
+		velocity.Y,
+		jumpDirection.Z * jumpMoveSpeed
+	)
+
+	if elapsed >= AI_CONFIG.JUMP_DURATION then
+		isJumping = false
+		forcePathRecompute = true
+		lastPathMovePosition = rootCollider.Position
+		lastPathMoveTime = os.clock()
+	end
+
+	return isJumping
+end
+
+--====================================================
+-- НАВИГАЦИЯ PATHFINDING SERVICE
+--====================================================
+
+local currentPath = nil
+local currentWaypoints = {}
+local currentWaypointIndex = 1
+local currentPathTargetPosition = nil
+local currentWaypointAction = nil
+local lastPathComputeTime = -math.huge
+local blockedPathConnection = nil
+forcePathRecompute = true
+lastPathMovePosition = rootCollider.Position
+lastPathMoveTime = os.clock()
+local avoidanceSide = 0
+local lastAvoidanceDecisionTime = -math.huge
+avoidancePoint = nil
+avoidancePointExpiresAt = 0
+
+clearPath = function()
+	currentPath = nil
+	currentWaypoints = {}
+	currentWaypointIndex = 1
+	currentPathTargetPosition = nil
+	currentWaypointAction = nil
+	forcePathRecompute = true
+	lastPathComputeTime = -math.huge
+	avoidanceSide = 0
+	lastAvoidanceDecisionTime = -math.huge
+	avoidancePoint = nil
+	avoidancePointExpiresAt = 0
+
+	if blockedPathConnection then
+		blockedPathConnection:Disconnect()
+		blockedPathConnection = nil
+	end
+end
+
+local function shouldRecomputePath(targetPosition)
+	local canRecomputeNow = os.clock() - lastPathComputeTime >= AI_CONFIG.PATH_RECOMPUTE_INTERVAL
+
+	if not currentPath or #currentWaypoints == 0 or not currentPathTargetPosition then
+		return canRecomputeNow
+	end
+
+	if forcePathRecompute then
+		return canRecomputeNow
+	end
+
+	if currentWaypointIndex > #currentWaypoints then
+		return canRecomputeNow
+	end
+
+	if (targetPosition - currentPathTargetPosition).Magnitude >= AI_CONFIG.PATH_TARGET_MOVE_THRESHOLD then
+		return canRecomputeNow
+	end
+
+	return false
+end
+
+local function computePathTo(targetPosition)
+	if not AI_CONFIG.USE_PATHFINDING then
+		return false
+	end
+
+	if not shouldRecomputePath(targetPosition) then
+		return #currentWaypoints > 0
+	end
+
+	lastPathComputeTime = os.clock()
+	forcePathRecompute = false
+
+	if blockedPathConnection then
+		blockedPathConnection:Disconnect()
+		blockedPathConnection = nil
+	end
+
+	local path = PathfindingService:CreatePath({
+		AgentRadius = AI_CONFIG.PATH_AGENT_RADIUS,
+		AgentHeight = AI_CONFIG.PATH_AGENT_HEIGHT,
+		AgentCanJump = AI_CONFIG.PATH_AGENT_CAN_JUMP,
+		AgentCanClimb = AI_CONFIG.PATH_AGENT_CAN_CLIMB,
+		WaypointSpacing = AI_CONFIG.PATH_WAYPOINT_SPACING,
+	})
+
+	local ok, errorMessage = pcall(function()
+		path:ComputeAsync(rootCollider.Position, targetPosition)
+	end)
+
+	if not ok or path.Status ~= Enum.PathStatus.Success then
+		currentPath = nil
+		currentWaypoints = {}
+		currentWaypointIndex = 1
+		currentPathTargetPosition = nil
+
+		if not ok then
+			warn("[PirateUnitAI] Pathfinding ComputeAsync failed:", errorMessage)
+		end
+
+		return false
+	end
+
+	currentPath = path
+	currentWaypoints = path:GetWaypoints()
+	currentWaypointIndex = (#currentWaypoints >= 2) and 2 or 1
+	currentPathTargetPosition = targetPosition
+	lastPathMovePosition = rootCollider.Position
+	lastPathMoveTime = os.clock()
+
+	blockedPathConnection = path.Blocked:Connect(function(blockedWaypointIndex)
+		if blockedWaypointIndex >= currentWaypointIndex then
+			forcePathRecompute = true
+		end
+	end)
+
+	return #currentWaypoints > 0
+end
+
+local function getNextPathWaypoint(targetPosition)
+	if not computePathTo(targetPosition) then
+		return targetPosition
+	end
+
+	while currentWaypointIndex <= #currentWaypoints do
+		local waypoint = currentWaypoints[currentWaypointIndex]
+		local flatWaypoint = Vector3.new(waypoint.Position.X, rootCollider.Position.Y, waypoint.Position.Z)
+
+		if (flatWaypoint - rootCollider.Position).Magnitude > AI_CONFIG.PATH_WAYPOINT_REACHED_DISTANCE then
+			currentWaypointAction = waypoint.Action
+			return waypoint.Position
+		end
+
+		currentWaypointIndex = currentWaypointIndex + 1
+	end
+
+	currentWaypointAction = nil
+	return targetPosition
+end
+
+local function updatePathStuckDetector()
+	local now = os.clock()
+	local flatCurrent = Vector3.new(rootCollider.Position.X, 0, rootCollider.Position.Z)
+	local flatLast = Vector3.new(lastPathMovePosition.X, 0, lastPathMovePosition.Z)
+
+	if (flatCurrent - flatLast).Magnitude >= AI_CONFIG.PATH_STUCK_DISTANCE then
+		lastPathMovePosition = rootCollider.Position
+		lastPathMoveTime = now
+		return
+	end
+
+	if now - lastPathMoveTime >= AI_CONFIG.PATH_STUCK_TIME then
+		forcePathRecompute = true
+		lastPathMovePosition = rootCollider.Position
+		lastPathMoveTime = now
+	end
+end
+
+local function getClearDistance(direction)
+	local result = raycastMovementObstacle(direction, AI_CONFIG.AVOIDANCE_SCAN_DISTANCE)
+
+	if not result then
+		return AI_CONFIG.AVOIDANCE_SCAN_DISTANCE
+	end
+
+	return (result.Position - (rootCollider.Position + Vector3.new(0, AI_CONFIG.AVOIDANCE_SCAN_HEIGHT, 0))).Magnitude
+end
+
+local function getFlatDistance(a, b)
+	return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
+end
+
+local function getObstacleSideClearance(result, sideVector)
+	if not result or not result.Instance or not result.Instance:IsA("BasePart") then
+		return AI_CONFIG.AVOIDANCE_MIN_SIDE_CLEARANCE
+	end
+
+	local part = result.Instance
+	local partCFrame = part.CFrame
+	local halfSize = part.Size * 0.5
+	local sideExtent = math.abs(sideVector:Dot(partCFrame.RightVector)) * halfSize.X
+		+ math.abs(sideVector:Dot(partCFrame.UpVector)) * halfSize.Y
+		+ math.abs(sideVector:Dot(partCFrame.LookVector)) * halfSize.Z
+
+	return math.clamp(sideExtent + AI_CONFIG.AVOIDANCE_SIDE_MARGIN, AI_CONFIG.AVOIDANCE_MIN_SIDE_CLEARANCE, AI_CONFIG.AVOIDANCE_MAX_SIDE_CLEARANCE)
+end
+
+local function chooseAvoidanceSide(direction)
+	local now = os.clock()
+	local left = Vector3.new(-direction.Z, 0, direction.X).Unit
+	local right = Vector3.new(direction.Z, 0, -direction.X).Unit
+
+	if avoidanceSide ~= 0 and now - lastAvoidanceDecisionTime < AI_CONFIG.AVOIDANCE_DECISION_INTERVAL then
+		return avoidanceSide, (avoidanceSide == 1) and left or right
+	end
+
+	local leftDiagonal = getClearDistance((direction + left * AI_CONFIG.AVOIDANCE_SIDE_WEIGHT).Unit)
+	local rightDiagonal = getClearDistance((direction + right * AI_CONFIG.AVOIDANCE_SIDE_WEIGHT).Unit)
+	local leftSide = getClearDistance(left)
+	local rightSide = getClearDistance(right)
+	local leftScore = leftDiagonal + leftSide * 0.75
+	local rightScore = rightDiagonal + rightSide * 0.75
+
+	avoidanceSide = (leftScore >= rightScore) and 1 or -1
+	lastAvoidanceDecisionTime = now
+
+	return avoidanceSide, (avoidanceSide == 1) and left or right
+end
+
+local function getAvoidanceMoveTarget(direction, defaultTargetPosition)
+	local now = os.clock()
+	local currentPosition = rootCollider.Position
+
+	if avoidancePoint and now < avoidancePointExpiresAt then
+		if getFlatDistance(currentPosition, avoidancePoint) > AI_CONFIG.AVOIDANCE_POINT_REACHED_DISTANCE then
+			return avoidancePoint
+		end
+
+		avoidancePoint = nil
+		avoidancePointExpiresAt = 0
+	end
+
+	local frontHit = raycastMovementObstacle(direction, AI_CONFIG.AVOIDANCE_SCAN_DISTANCE)
+
+	if not frontHit or isClimbableFenceHit(frontHit) then
+		avoidanceSide = 0
+		avoidancePoint = nil
+		avoidancePointExpiresAt = 0
+		return defaultTargetPosition
+	end
+
+	local _, sideVector = chooseAvoidanceSide(direction)
+	local sideClearance = getObstacleSideClearance(frontHit, sideVector)
+
+	-- Идём не «чуть-чуть в сторону», а к отдельной обходной точке с запасом
+	-- за габарит препятствия. Точка строится от текущей позиции, чтобы NPC
+	-- сначала вышел вбок от камня/стены, а не пытался пройти сквозь её край.
+	avoidancePoint = currentPosition
+		+ sideVector * sideClearance
+		+ direction * AI_CONFIG.AVOIDANCE_FORWARD_CLEARANCE
+	avoidancePointExpiresAt = now + AI_CONFIG.AVOIDANCE_COMMIT_TIME
+	forcePathRecompute = true
+
+	return avoidancePoint
 end
 
 -- Вектор «прочь от соседних юнитов»: физически друг с другом они не
@@ -1161,8 +1924,11 @@ local function getSeparationVector()
 end
 
 local function moveTowards(targetPosition, speed)
+	local moveTargetPosition = getNextPathWaypoint(targetPosition)
+	updatePathStuckDetector()
+
 	local currentPosition = rootCollider.Position
-	local flatTarget = Vector3.new(targetPosition.X, currentPosition.Y, targetPosition.Z)
+	local flatTarget = Vector3.new(moveTargetPosition.X, currentPosition.Y, moveTargetPosition.Z)
 	local offset = flatTarget - currentPosition
 
 	if offset.Magnitude <= 0.1 then
@@ -1170,10 +1936,47 @@ local function moveTowards(targetPosition, speed)
 		return
 	end
 
+	local desiredDirection = offset.Unit
+	local flatDirectTarget = Vector3.new(targetPosition.X, currentPosition.Y, targetPosition.Z)
+	local directTargetOffset = flatDirectTarget - currentPosition
+
+	-- Если сам игрок прямо за забором, выбираем перелезание, даже если
+	-- PathfindingService предлагает длинный обходной waypoint.
+	if directTargetOffset.Magnitude > 0.1 and tryStartClimb(directTargetOffset.Unit) then
+		return
+	end
+
+	if tryStartClimb(desiredDirection) then
+		return
+	end
+
+	if directTargetOffset.Magnitude > 0.1 and tryStartJump(directTargetOffset.Unit, speed, false) then
+		return
+	end
+
+	if currentWaypointAction == Enum.PathWaypointAction.Jump and tryStartJump(desiredDirection, speed, true) then
+		return
+	end
+
+	if tryStartJump(desiredDirection, speed, false) then
+		return
+	end
+
+	local avoidedTargetPosition = getAvoidanceMoveTarget(desiredDirection, flatTarget)
+	local avoidedOffset = avoidedTargetPosition - currentPosition
+
+	if avoidedOffset.Magnitude <= 0.1 then
+		stopMovement()
+		return
+	end
+
+	local movementDirection = avoidedOffset.Unit
+	faceTowards(currentPosition + movementDirection)
+
 	-- К направлению на цель добавляем разведение от соседей.
-	local direction = offset.Unit + getSeparationVector() * SEPARATION_STRENGTH
+	local direction = movementDirection + getSeparationVector() * SEPARATION_STRENGTH
 	if direction.Magnitude < 0.05 then
-		direction = offset.Unit
+		direction = movementDirection
 	else
 		direction = direction.Unit
 	end
@@ -1258,7 +2061,22 @@ RunService.Heartbeat:Connect(function()
 		end
 	end)
 
-	stabilizeOnGround()
+	if isClimbing then
+		updateClimbMotion()
+		return
+	end
+
+	if isJumping then
+		updateJumpMotion()
+		return
+	end
+
+	local now = os.clock()
+	if now >= climbGroundGraceUntil and now >= jumpGroundGraceUntil then
+		stabilizeOnGround()
+	else
+		limitUpwardLaunch()
+	end
 
 	-- 1. Если текущей цели нет, ищем игрока в обычном радиусе 20.
 	if not currentTargetCharacter then
@@ -1273,6 +2091,7 @@ RunService.Heartbeat:Connect(function()
 			currentTargetCharacter = character
 			isChasingEscapedTarget = false
 		else
+			clearPath()
 			stopMovement()
 			playIdle()
 
@@ -1312,7 +2131,12 @@ RunService.Heartbeat:Connect(function()
 		isChasingEscapedTarget = false
 	end
 
-	faceTowards(targetRoot.Position)
+	-- Смотрим прямо на игрока только рядом с атакой. Во время дальнего
+	-- движения moveTowards разворачивает NPC к следующей точке маршрута,
+	-- чтобы он не шёл боком вокруг забора или камня.
+	if distance <= ATTACK_RANGE + 2 then
+		faceTowards(targetRoot.Position)
+	end
 
 	-- 5. Атака работает в любом режиме, если игрок близко.
 	if distance <= ATTACK_RANGE then
@@ -1331,16 +2155,9 @@ RunService.Heartbeat:Connect(function()
 		return
 	end
 
-	-- 6. Движение:
-	-- обычный режим = Walk
-	-- игрок убежал за 20 после обнаружения = Run x1.5
-	if isChasingEscapedTarget then
-		moveTowards(targetRoot.Position, MOVE_SPEED * RUN_SPEED_MULTIPLIER)
-		playRun()
-	else
-		moveTowards(targetRoot.Position, MOVE_SPEED)
-		playWalk()
-	end
+	-- 6. Если игрок уже замечен, пират не идёт шагом — только бежит.
+	moveTowards(targetRoot.Position, MOVE_SPEED * RUN_SPEED_MULTIPLIER)
+	playRun()
 end)
 
-print("[PirateUnitAI] Pirate AI with chase mode loaded. Root:", rootCollider:GetFullName())
+print("[PirateUnitAI] Pirate AI with running chase, smooth turning, jumping, wide avoidance, and fence climbing loaded. Root:", rootCollider:GetFullName())
