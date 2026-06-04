@@ -1,5 +1,6 @@
 local RunService = game:GetService("RunService")
 local PhysicsService = game:GetService("PhysicsService")
+local PathfindingService = game:GetService("PathfindingService")
 local Players = game:GetService("Players")
 local CollectionService = game:GetService("CollectionService")
 
@@ -46,6 +47,21 @@ local CHASE_STOP_DISTANCE = 5
 
 local MOVE_SPEED = 10
 local RUN_SPEED_MULTIPLIER = 1.5
+
+-- Общая навигация для всех наземных NPC: вместо прямого бега в стену
+-- строим маршрут через PathfindingService и двигаемся по точкам пути.
+local USE_PATHFINDING = true
+local PATH_AGENT_RADIUS = 2.2
+local PATH_AGENT_HEIGHT = 5
+local PATH_AGENT_CAN_JUMP = false
+local PATH_AGENT_CAN_CLIMB = false
+local PATH_WAYPOINT_SPACING = 4
+local PATH_RECOMPUTE_INTERVAL = 0.65
+local PATH_TARGET_MOVE_THRESHOLD = 5
+local PATH_WAYPOINT_REACHED_DISTANCE = 2.25
+local PATH_STUCK_DISTANCE = 0.65
+local PATH_STUCK_TIME = 1.2
+
 
 local ATTACK_RANGE = 4.2
 local ATTACK_COOLDOWN = 1.4
@@ -782,6 +798,7 @@ end
 -- Если ноги поднялись выше нормальной высоты больше чем на столько —
 -- считаем это баг-подбросом и жёстко возвращаем NPC к земле.
 local MAX_HOVER_ABOVE_GROUND = 2.5
+local limitUpwardLaunch
 
 local function stabilizeOnGround()
 	local legBottomY = getLegBottomY()
@@ -816,7 +833,7 @@ local function stabilizeOnGround()
 	end
 end
 
-local function limitUpwardLaunch()
+limitUpwardLaunch = function()
 	local velocity = rootCollider.AssemblyLinearVelocity
 
 	if velocity.Y <= MAX_UPWARD_VELOCITY then
@@ -1127,6 +1144,7 @@ end
 
 local lastAttackTime = 0
 local isAttacking = false
+local clearPath
 
 local currentTargetCharacter = nil
 local isChasingEscapedTarget = false
@@ -1134,11 +1152,156 @@ local isChasingEscapedTarget = false
 local function clearTarget()
 	currentTargetCharacter = nil
 	isChasingEscapedTarget = false
+	clearPath()
 end
 
 local function stopMovement()
 	local velocity = rootCollider.AssemblyLinearVelocity
 	rootCollider.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+end
+
+--====================================================
+-- НАВИГАЦИЯ PATHFINDING SERVICE
+--====================================================
+
+local currentPath = nil
+local currentWaypoints = {}
+local currentWaypointIndex = 1
+local currentPathTargetPosition = nil
+local lastPathComputeTime = -math.huge
+local blockedPathConnection = nil
+local forcePathRecompute = true
+local lastPathMovePosition = rootCollider.Position
+local lastPathMoveTime = os.clock()
+
+clearPath = function()
+	currentPath = nil
+	currentWaypoints = {}
+	currentWaypointIndex = 1
+	currentPathTargetPosition = nil
+	forcePathRecompute = true
+
+	if blockedPathConnection then
+		blockedPathConnection:Disconnect()
+		blockedPathConnection = nil
+	end
+end
+
+local function shouldRecomputePath(targetPosition)
+	if not currentPath or #currentWaypoints == 0 or not currentPathTargetPosition then
+		return true
+	end
+
+	local canRecomputeNow = os.clock() - lastPathComputeTime >= PATH_RECOMPUTE_INTERVAL
+
+	if forcePathRecompute then
+		return canRecomputeNow
+	end
+
+	if currentWaypointIndex > #currentWaypoints then
+		return canRecomputeNow
+	end
+
+	if (targetPosition - currentPathTargetPosition).Magnitude >= PATH_TARGET_MOVE_THRESHOLD then
+		return canRecomputeNow
+	end
+
+	return false
+end
+
+local function computePathTo(targetPosition)
+	if not USE_PATHFINDING then
+		return false
+	end
+
+	if not shouldRecomputePath(targetPosition) then
+		return #currentWaypoints > 0
+	end
+
+	lastPathComputeTime = os.clock()
+	forcePathRecompute = false
+
+	if blockedPathConnection then
+		blockedPathConnection:Disconnect()
+		blockedPathConnection = nil
+	end
+
+	local path = PathfindingService:CreatePath({
+		AgentRadius = PATH_AGENT_RADIUS,
+		AgentHeight = PATH_AGENT_HEIGHT,
+		AgentCanJump = PATH_AGENT_CAN_JUMP,
+		AgentCanClimb = PATH_AGENT_CAN_CLIMB,
+		WaypointSpacing = PATH_WAYPOINT_SPACING,
+	})
+
+	local ok, errorMessage = pcall(function()
+		path:ComputeAsync(rootCollider.Position, targetPosition)
+	end)
+
+	if not ok or path.Status ~= Enum.PathStatus.Success then
+		currentPath = nil
+		currentWaypoints = {}
+		currentWaypointIndex = 1
+		currentPathTargetPosition = nil
+
+		if not ok then
+			warn("[PirateUnitAI] Pathfinding ComputeAsync failed:", errorMessage)
+		end
+
+		return false
+	end
+
+	currentPath = path
+	currentWaypoints = path:GetWaypoints()
+	currentWaypointIndex = (#currentWaypoints >= 2) and 2 or 1
+	currentPathTargetPosition = targetPosition
+	lastPathMovePosition = rootCollider.Position
+	lastPathMoveTime = os.clock()
+
+	blockedPathConnection = path.Blocked:Connect(function(blockedWaypointIndex)
+		if blockedWaypointIndex >= currentWaypointIndex then
+			forcePathRecompute = true
+		end
+	end)
+
+	return #currentWaypoints > 0
+end
+
+local function getNextPathWaypoint(targetPosition)
+	if not computePathTo(targetPosition) then
+		return targetPosition
+	end
+
+	while currentWaypointIndex <= #currentWaypoints do
+		local waypoint = currentWaypoints[currentWaypointIndex]
+		local flatWaypoint = Vector3.new(waypoint.Position.X, rootCollider.Position.Y, waypoint.Position.Z)
+
+		if (flatWaypoint - rootCollider.Position).Magnitude > PATH_WAYPOINT_REACHED_DISTANCE then
+			return waypoint.Position
+		end
+
+		currentWaypointIndex += 1
+	end
+
+	return targetPosition
+end
+
+local function updatePathStuckDetector()
+	local now = os.clock()
+	local flatCurrent = Vector3.new(rootCollider.Position.X, 0, rootCollider.Position.Z)
+	local flatLast = Vector3.new(lastPathMovePosition.X, 0, lastPathMovePosition.Z)
+
+	if (flatCurrent - flatLast).Magnitude >= PATH_STUCK_DISTANCE then
+		lastPathMovePosition = rootCollider.Position
+		lastPathMoveTime = now
+		return
+	end
+
+	if now - lastPathMoveTime >= PATH_STUCK_TIME then
+		forcePathRecompute = true
+		lastPathMovePosition = rootCollider.Position
+		lastPathMoveTime = now
+	end
 end
 
 -- Вектор «прочь от соседних юнитов»: физически друг с другом они не
@@ -1161,14 +1324,19 @@ local function getSeparationVector()
 end
 
 local function moveTowards(targetPosition, speed)
+	local moveTargetPosition = getNextPathWaypoint(targetPosition)
+	updatePathStuckDetector()
+
 	local currentPosition = rootCollider.Position
-	local flatTarget = Vector3.new(targetPosition.X, currentPosition.Y, targetPosition.Z)
+	local flatTarget = Vector3.new(moveTargetPosition.X, currentPosition.Y, moveTargetPosition.Z)
 	local offset = flatTarget - currentPosition
 
 	if offset.Magnitude <= 0.1 then
 		stopMovement()
 		return
 	end
+
+	faceTowards(flatTarget)
 
 	-- К направлению на цель добавляем разведение от соседей.
 	local direction = offset.Unit + getSeparationVector() * SEPARATION_STRENGTH
@@ -1273,6 +1441,7 @@ RunService.Heartbeat:Connect(function()
 			currentTargetCharacter = character
 			isChasingEscapedTarget = false
 		else
+			clearPath()
 			stopMovement()
 			playIdle()
 
@@ -1312,7 +1481,12 @@ RunService.Heartbeat:Connect(function()
 		isChasingEscapedTarget = false
 	end
 
-	faceTowards(targetRoot.Position)
+	-- Смотрим прямо на игрока только рядом с атакой. Во время дальнего
+	-- движения moveTowards разворачивает NPC к следующей точке маршрута,
+	-- чтобы он не шёл боком вокруг забора или камня.
+	if distance <= ATTACK_RANGE + 2 then
+		faceTowards(targetRoot.Position)
+	end
 
 	-- 5. Атака работает в любом режиме, если игрок близко.
 	if distance <= ATTACK_RANGE then
@@ -1343,4 +1517,4 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
-print("[PirateUnitAI] Pirate AI with chase mode loaded. Root:", rootCollider:GetFullName())
+print("[PirateUnitAI] Pirate AI with PathfindingService navigation loaded. Root:", rootCollider:GetFullName())
