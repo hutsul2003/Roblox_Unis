@@ -933,7 +933,7 @@ local function getSteppedYaw(targetYaw)
 	if math.abs(delta) <= maxStep then
 		currentSmoothedYaw = targetYaw
 	else
-		currentSmoothedYaw += math.sign(delta) * maxStep
+		currentSmoothedYaw = currentSmoothedYaw + ((delta >= 0) and 1 or -1) * maxStep
 	end
 
 	return currentSmoothedYaw
@@ -952,7 +952,7 @@ local function getYawFacingPosition(targetPosition)
 	local lookCFrame = CFrame.lookAt(currentPosition, flatTarget)
 	local _, yaw, _ = lookCFrame:ToOrientation()
 
-	yaw += math.rad(MODEL_YAW_OFFSET_DEGREES)
+	yaw = yaw + math.rad(MODEL_YAW_OFFSET_DEGREES)
 
 	return yaw
 end
@@ -1706,7 +1706,7 @@ local function getNextPathWaypoint(targetPosition)
 			return waypoint.Position
 		end
 
-		currentWaypointIndex += 1
+		currentWaypointIndex = currentWaypointIndex + 1
 	end
 
 	currentWaypointAction = nil
