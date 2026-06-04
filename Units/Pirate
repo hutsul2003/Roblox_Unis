@@ -65,10 +65,16 @@ local PATH_STUCK_TIME = 1.6
 
 -- Дополнительная «задумчивость»: если впереди препятствие, NPC выбирает
 -- сторону обхода и держит её минимум это время, чтобы не метаться влево/вправо.
-local AVOIDANCE_SCAN_DISTANCE = 5.5
+local AVOIDANCE_SCAN_DISTANCE = 7
 local AVOIDANCE_SCAN_HEIGHT = 2.2
 local AVOIDANCE_SIDE_WEIGHT = 0.9
 local AVOIDANCE_DECISION_INTERVAL = 1.25
+local AVOIDANCE_COMMIT_TIME = 1.7
+local AVOIDANCE_POINT_REACHED_DISTANCE = 2.35
+local AVOIDANCE_FORWARD_CLEARANCE = 4
+local AVOIDANCE_SIDE_MARGIN = 4.5
+local AVOIDANCE_MIN_SIDE_CLEARANCE = 5.5
+local AVOIDANCE_MAX_SIDE_CLEARANCE = 12
 
 -- Забор пират не обходит, а перелезает: 2 секунды анимации Climb,
 -- подъём начинается на 0.3 секунде и поднимает модель на высоту забора (6 studs).
@@ -1385,6 +1391,8 @@ lastPathMovePosition = rootCollider.Position
 lastPathMoveTime = os.clock()
 local avoidanceSide = 0
 local lastAvoidanceDecisionTime = -math.huge
+local avoidancePoint = nil
+local avoidancePointExpiresAt = 0
 
 clearPath = function()
 	currentPath = nil
@@ -1392,8 +1400,11 @@ clearPath = function()
 	currentWaypointIndex = 1
 	currentPathTargetPosition = nil
 	forcePathRecompute = true
+	lastPathComputeTime = -math.huge
 	avoidanceSide = 0
 	lastAvoidanceDecisionTime = -math.huge
+	avoidancePoint = nil
+	avoidancePointExpiresAt = 0
 
 	if blockedPathConnection then
 		blockedPathConnection:Disconnect()
@@ -1528,28 +1539,82 @@ local function getClearDistance(direction)
 	return (result.Position - (rootCollider.Position + Vector3.new(0, AVOIDANCE_SCAN_HEIGHT, 0))).Magnitude
 end
 
-local function getAvoidedDirection(direction)
-	local frontHit = raycastMovementObstacle(direction, AVOIDANCE_SCAN_DISTANCE)
+local function getFlatDistance(a, b)
+	return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
+end
 
-	if not frontHit or isClimbableFenceHit(frontHit) then
-		avoidanceSide = 0
-		return direction
+local function getObstacleSideClearance(result, sideVector)
+	if not result or not result.Instance or not result.Instance:IsA("BasePart") then
+		return AVOIDANCE_MIN_SIDE_CLEARANCE
 	end
 
+	local part = result.Instance
+	local partCFrame = part.CFrame
+	local halfSize = part.Size * 0.5
+	local sideExtent = math.abs(sideVector:Dot(partCFrame.RightVector)) * halfSize.X
+		+ math.abs(sideVector:Dot(partCFrame.UpVector)) * halfSize.Y
+		+ math.abs(sideVector:Dot(partCFrame.LookVector)) * halfSize.Z
+
+	return math.clamp(sideExtent + AVOIDANCE_SIDE_MARGIN, AVOIDANCE_MIN_SIDE_CLEARANCE, AVOIDANCE_MAX_SIDE_CLEARANCE)
+end
+
+local function chooseAvoidanceSide(direction)
 	local now = os.clock()
 	local left = Vector3.new(-direction.Z, 0, direction.X).Unit
 	local right = Vector3.new(direction.Z, 0, -direction.X).Unit
 
-	if avoidanceSide == 0 or now - lastAvoidanceDecisionTime >= AVOIDANCE_DECISION_INTERVAL then
-		local leftDistance = getClearDistance((direction + left * AVOIDANCE_SIDE_WEIGHT).Unit)
-		local rightDistance = getClearDistance((direction + right * AVOIDANCE_SIDE_WEIGHT).Unit)
-
-		avoidanceSide = (leftDistance >= rightDistance) and 1 or -1
-		lastAvoidanceDecisionTime = now
+	if avoidanceSide ~= 0 and now - lastAvoidanceDecisionTime < AVOIDANCE_DECISION_INTERVAL then
+		return avoidanceSide, (avoidanceSide == 1) and left or right
 	end
 
-	local sideVector = (avoidanceSide == 1) and left or right
-	return (direction + sideVector * AVOIDANCE_SIDE_WEIGHT).Unit
+	local leftDiagonal = getClearDistance((direction + left * AVOIDANCE_SIDE_WEIGHT).Unit)
+	local rightDiagonal = getClearDistance((direction + right * AVOIDANCE_SIDE_WEIGHT).Unit)
+	local leftSide = getClearDistance(left)
+	local rightSide = getClearDistance(right)
+	local leftScore = leftDiagonal + leftSide * 0.75
+	local rightScore = rightDiagonal + rightSide * 0.75
+
+	avoidanceSide = (leftScore >= rightScore) and 1 or -1
+	lastAvoidanceDecisionTime = now
+
+	return avoidanceSide, (avoidanceSide == 1) and left or right
+end
+
+local function getAvoidanceMoveTarget(direction, defaultTargetPosition)
+	local now = os.clock()
+	local currentPosition = rootCollider.Position
+
+	if avoidancePoint and now < avoidancePointExpiresAt then
+		if getFlatDistance(currentPosition, avoidancePoint) > AVOIDANCE_POINT_REACHED_DISTANCE then
+			return avoidancePoint
+		end
+
+		avoidancePoint = nil
+		avoidancePointExpiresAt = 0
+	end
+
+	local frontHit = raycastMovementObstacle(direction, AVOIDANCE_SCAN_DISTANCE)
+
+	if not frontHit or isClimbableFenceHit(frontHit) then
+		avoidanceSide = 0
+		avoidancePoint = nil
+		avoidancePointExpiresAt = 0
+		return defaultTargetPosition
+	end
+
+	local _, sideVector = chooseAvoidanceSide(direction)
+	local sideClearance = getObstacleSideClearance(frontHit, sideVector)
+
+	-- Идём не «чуть-чуть в сторону», а к отдельной обходной точке с запасом
+	-- за габарит препятствия. Точка строится от текущей позиции, чтобы NPC
+	-- сначала вышел вбок от камня/стены, а не пытался пройти сквозь её край.
+	avoidancePoint = currentPosition
+		+ sideVector * sideClearance
+		+ direction * AVOIDANCE_FORWARD_CLEARANCE
+	avoidancePointExpiresAt = now + AVOIDANCE_COMMIT_TIME
+	forcePathRecompute = true
+
+	return avoidancePoint
 end
 
 -- Вектор «прочь от соседних юнитов»: физически друг с другом они не
@@ -1598,7 +1663,15 @@ local function moveTowards(targetPosition, speed)
 		return
 	end
 
-	local movementDirection = getAvoidedDirection(desiredDirection)
+	local avoidedTargetPosition = getAvoidanceMoveTarget(desiredDirection, flatTarget)
+	local avoidedOffset = avoidedTargetPosition - currentPosition
+
+	if avoidedOffset.Magnitude <= 0.1 then
+		stopMovement()
+		return
+	end
+
+	local movementDirection = avoidedOffset.Unit
 	faceTowards(currentPosition + movementDirection)
 
 	-- К направлению на цель добавляем разведение от соседей.
@@ -1777,16 +1850,9 @@ RunService.Heartbeat:Connect(function()
 		return
 	end
 
-	-- 6. Движение:
-	-- обычный режим = Walk
-	-- игрок убежал за 20 после обнаружения = Run x1.5
-	if isChasingEscapedTarget then
-		moveTowards(targetRoot.Position, MOVE_SPEED * RUN_SPEED_MULTIPLIER)
-		playRun()
-	else
-		moveTowards(targetRoot.Position, MOVE_SPEED)
-		playWalk()
-	end
+	-- 6. Если игрок уже замечен, пират не идёт шагом — только бежит.
+	moveTowards(targetRoot.Position, MOVE_SPEED * RUN_SPEED_MULTIPLIER)
+	playRun()
 end)
 
-print("[PirateUnitAI] Pirate AI with pathfinding, avoidance, and fence climbing loaded. Root:", rootCollider:GetFullName())
+print("[PirateUnitAI] Pirate AI with running chase, wide avoidance, and fence climbing loaded. Root:", rootCollider:GetFullName())
