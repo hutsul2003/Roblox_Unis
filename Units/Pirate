@@ -52,6 +52,16 @@ local function bootstrapColliderWelds()
 		return
 	end
 
+	for _, object in ipairs(bootstrapBodyColliders:GetDescendants()) do
+		if object:IsA("BasePart") then
+			object.Anchored = true
+		end
+	end
+
+	if bootstrapVisualMesh and bootstrapVisualMesh:IsA("BasePart") then
+		bootstrapVisualMesh.Anchored = true
+	end
+
 	for _, object in ipairs(npc:GetDescendants()) do
 		if object:IsA("WeldConstraint") then
 			if object.Name == "PirateColliderWeld" or object.Name == "PirateVisualWeld" then
@@ -62,7 +72,6 @@ local function bootstrapColliderWelds()
 
 	for _, object in ipairs(bootstrapBodyColliders:GetDescendants()) do
 		if object:IsA("BasePart") then
-			object.Anchored = false
 			object.CanQuery = true
 			object.Transparency = DEBUG_VISIBLE and 0.45 or 1
 
@@ -77,7 +86,6 @@ local function bootstrapColliderWelds()
 	end
 
 	if bootstrapVisualMesh and bootstrapVisualMesh:IsA("BasePart") then
-		bootstrapVisualMesh.Anchored = false
 		bootstrapVisualMesh.CanCollide = false
 		bootstrapVisualMesh.CanTouch = false
 		bootstrapVisualMesh.Massless = true
@@ -87,6 +95,16 @@ local function bootstrapColliderWelds()
 		visualWeld.Part0 = bootstrapRootCollider
 		visualWeld.Part1 = bootstrapVisualMesh
 		visualWeld.Parent = bootstrapRootCollider
+	end
+
+	for _, object in ipairs(bootstrapBodyColliders:GetDescendants()) do
+		if object:IsA("BasePart") then
+			object.Anchored = false
+		end
+	end
+
+	if bootstrapVisualMesh and bootstrapVisualMesh:IsA("BasePart") then
+		bootstrapVisualMesh.Anchored = false
 	end
 end
 
@@ -721,6 +739,18 @@ end
 --====================================================
 -- ФИЗИКА NPC
 --====================================================
+
+-- Пересобираем weld'ы атомарно: сначала временно закрепляем части,
+-- чтобы они не успевали физически разлететься при удалении старых weld'ов.
+for _, object in ipairs(bodyColliders:GetDescendants()) do
+	if object:IsA("BasePart") then
+		object.Anchored = true
+	end
+end
+
+if visualMesh then
+	visualMesh.Anchored = true
+end
 
 for _, object in ipairs(npc:GetDescendants()) do
 	if object:IsA("WeldConstraint") then
