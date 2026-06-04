@@ -18,6 +18,7 @@ local WALK_ANIMATION_NAME = "Walk"
 local RUN_ANIMATION_NAME = "Run"
 local ATTACK_ANIMATION_NAME = "Attack"
 local CLIMB_ANIMATION_NAME = "Climb"
+local JUMP_ANIMATION_NAME = "Jump"
 
 local ROOT_COLLIDER_NAME = "TorsoCollider"
 
@@ -54,7 +55,7 @@ local RUN_SPEED_MULTIPLIER = 1.5
 local USE_PATHFINDING = true
 local PATH_AGENT_RADIUS = 2.2
 local PATH_AGENT_HEIGHT = 5
-local PATH_AGENT_CAN_JUMP = false
+local PATH_AGENT_CAN_JUMP = true
 local PATH_AGENT_CAN_CLIMB = false
 local PATH_WAYPOINT_SPACING = 4
 local PATH_RECOMPUTE_INTERVAL = 1.35
@@ -86,6 +87,24 @@ local CLIMB_ASCEND_DELAY = 0.3
 local CLIMB_COOLDOWN = 1.25
 local CLIMB_MIN_OBSTACLE_HEIGHT = 3.5
 local CLIMB_MAX_OBSTACLE_HEIGHT = 7.5
+
+-- Прыжок нужен для камней/низких препятствий, когда NPC видит цель за ними
+-- и должен перепрыгнуть, как обычный Roblox NPC. Анимация Jump необязательна:
+-- когда добавишь её в модель, скрипт начнёт проигрывать её автоматически.
+local JUMP_SCAN_DISTANCE = 5.5
+local JUMP_SCAN_HEIGHT = 1.35
+local JUMP_MIN_OBSTACLE_HEIGHT = 0.45
+local JUMP_MAX_OBSTACLE_HEIGHT = 5.5
+local JUMP_COOLDOWN = 1.15
+local JUMP_DURATION = 0.78
+local JUMP_VERTICAL_SPEED = 42
+local JUMP_FORWARD_SPEED_MULTIPLIER = 1.15
+local JUMP_GROUND_GRACE = 0.35
+
+-- Ограничиваем скорость разворота, чтобы NPC не дёргался при смене решения.
+local ROTATION_TURN_SPEED_DEGREES = 220
+local ROTATION_MIN_STEP_DELTA = 1 / 120
+local ROTATION_MAX_STEP_DELTA = 1 / 30
 
 local ATTACK_RANGE = 4.2
 local ATTACK_COOLDOWN = 1.4
@@ -893,6 +912,32 @@ if not alignOrientation then
 end
 
 local desiredYaw = 0
+local currentSmoothedYaw = nil
+local lastFaceTowardsTime = os.clock()
+
+local function getShortestAngleDelta(fromYaw, toYaw)
+	return math.atan2(math.sin(toYaw - fromYaw), math.cos(toYaw - fromYaw))
+end
+
+local function getSteppedYaw(targetYaw)
+	local now = os.clock()
+	local deltaTime = math.clamp(now - lastFaceTowardsTime, ROTATION_MIN_STEP_DELTA, ROTATION_MAX_STEP_DELTA)
+	lastFaceTowardsTime = now
+
+	local _, actualYaw, _ = rootCollider.CFrame:ToOrientation()
+	currentSmoothedYaw = currentSmoothedYaw or actualYaw
+
+	local delta = getShortestAngleDelta(currentSmoothedYaw, targetYaw)
+	local maxStep = math.rad(ROTATION_TURN_SPEED_DEGREES) * deltaTime
+
+	if math.abs(delta) <= maxStep then
+		currentSmoothedYaw = targetYaw
+	else
+		currentSmoothedYaw += math.sign(delta) * maxStep
+	end
+
+	return currentSmoothedYaw
+end
 
 local function getYawFacingPosition(targetPosition)
 	local currentPosition = rootCollider.Position
@@ -914,14 +959,15 @@ end
 
 local function faceTowards(targetPosition)
 	desiredYaw = getYawFacingPosition(targetPosition)
+	local steppedYaw = getSteppedYaw(desiredYaw)
 
-	alignOrientation.CFrame = CFrame.Angles(0, desiredYaw, 0)
+	alignOrientation.CFrame = CFrame.Angles(0, steppedYaw, 0)
 
 	if FORCE_DIRECT_ROTATION then
 		local position = rootCollider.Position
 		local velocity = rootCollider.AssemblyLinearVelocity
 
-		rootCollider.CFrame = CFrame.new(position) * CFrame.Angles(0, desiredYaw, 0)
+		rootCollider.CFrame = CFrame.new(position) * CFrame.Angles(0, steppedYaw, 0)
 		rootCollider.AssemblyLinearVelocity = velocity
 		rootCollider.AssemblyAngularVelocity = Vector3.zero
 	end
@@ -954,6 +1000,7 @@ local walkAnimation = npc:FindFirstChild(WALK_ANIMATION_NAME, true)
 local runAnimation = npc:FindFirstChild(RUN_ANIMATION_NAME, true)
 local attackAnimation = npc:FindFirstChild(ATTACK_ANIMATION_NAME, true)
 local climbAnimation = npc:FindFirstChild(CLIMB_ANIMATION_NAME, true)
+local jumpAnimation = npc:FindFirstChild(JUMP_ANIMATION_NAME, true)
 
 if not idleAnimation or not idleAnimation:IsA("Animation") then
 	warn("[PirateUnitAI] Idle animation not found")
@@ -976,6 +1023,7 @@ local attackTrack = animator:LoadAnimation(attackAnimation)
 
 local runTrack = nil
 local climbTrack = nil
+local jumpTrack = nil
 
 if runAnimation and runAnimation:IsA("Animation") then
 	runTrack = animator:LoadAnimation(runAnimation)
@@ -990,6 +1038,10 @@ else
 	warn("[PirateUnitAI] Climb animation not found. Fence climbing will still move the NPC, but without the Climb track.")
 end
 
+if jumpAnimation and jumpAnimation:IsA("Animation") then
+	jumpTrack = animator:LoadAnimation(jumpAnimation)
+end
+
 idleTrack.Looped = true
 walkTrack.Looped = true
 runTrack.Looped = true
@@ -999,6 +1051,10 @@ if climbTrack then
 	climbTrack.Looped = false
 end
 
+if jumpTrack then
+	jumpTrack.Looped = false
+end
+
 idleTrack.Priority = Enum.AnimationPriority.Idle
 walkTrack.Priority = Enum.AnimationPriority.Movement
 runTrack.Priority = Enum.AnimationPriority.Movement
@@ -1006,6 +1062,10 @@ attackTrack.Priority = Enum.AnimationPriority.Action
 
 if climbTrack then
 	climbTrack.Priority = Enum.AnimationPriority.Action
+end
+
+if jumpTrack then
+	jumpTrack.Priority = Enum.AnimationPriority.Action
 end
 
 local currentAnimationState = nil
@@ -1027,6 +1087,10 @@ local function playIdle()
 
 	if climbTrack then
 		climbTrack:Stop(0.1)
+	end
+
+	if jumpTrack then
+		jumpTrack:Stop(0.1)
 	end
 
 	if not idleTrack.IsPlaying then
@@ -1053,6 +1117,10 @@ local function playWalk()
 		climbTrack:Stop(0.1)
 	end
 
+	if jumpTrack then
+		jumpTrack:Stop(0.1)
+	end
+
 	if not walkTrack.IsPlaying then
 		walkTrack:Play(0.2)
 	end
@@ -1071,6 +1139,10 @@ local function playRun()
 
 	if climbTrack then
 		climbTrack:Stop(0.1)
+	end
+
+	if jumpTrack then
+		jumpTrack:Stop(0.1)
 	end
 
 	if not runTrack.IsPlaying then
@@ -1092,6 +1164,10 @@ local function playAttack()
 		climbTrack:Stop(0.05)
 	end
 
+	if jumpTrack then
+		jumpTrack:Stop(0.05)
+	end
+
 	attackTrack:Stop(0)
 	attackTrack:Play(0.05)
 end
@@ -1108,9 +1184,35 @@ local function playClimb()
 
 	attackTrack:Stop(0.05)
 
+	if jumpTrack then
+		jumpTrack:Stop(0.05)
+	end
+
 	if climbTrack then
 		climbTrack:Stop(0)
 		climbTrack:Play(0.05)
+	end
+end
+
+local function playJump()
+	currentAnimationState = "Jump"
+
+	idleTrack:Stop(0.1)
+	walkTrack:Stop(0.1)
+
+	if runTrack ~= walkTrack then
+		runTrack:Stop(0.1)
+	end
+
+	attackTrack:Stop(0.05)
+
+	if climbTrack then
+		climbTrack:Stop(0.05)
+	end
+
+	if jumpTrack then
+		jumpTrack:Stop(0)
+		jumpTrack:Play(0.05)
 	end
 end
 
@@ -1223,10 +1325,18 @@ local climbStartTime = 0
 local climbStartCFrame = nil
 local lastClimbTime = -math.huge
 local climbGroundGraceUntil = 0
+local isJumping = false
+local jumpStartTime = 0
+local lastJumpTime = -math.huge
+local jumpDirection = Vector3.zero
+local jumpMoveSpeed = 0
+local jumpGroundGraceUntil = 0
 local clearPath
 local forcePathRecompute
 local lastPathMovePosition
 local lastPathMoveTime
+local avoidancePoint
+local avoidancePointExpiresAt
 
 local currentTargetCharacter = nil
 local isChasingEscapedTarget = false
@@ -1353,7 +1463,7 @@ local function updateClimbMotion()
 end
 
 local function tryStartClimb(direction)
-	if isClimbing or os.clock() - lastClimbTime < CLIMB_COOLDOWN then
+	if isClimbing or isJumping or os.clock() - lastClimbTime < CLIMB_COOLDOWN then
 		return false
 	end
 
@@ -1376,6 +1486,94 @@ local function tryStartClimb(direction)
 	return true
 end
 
+local function isJumpableObstacleHit(result)
+	if not result or not result.Instance or not result.Instance:IsA("BasePart") then
+		return false
+	end
+
+	if isClimbableFenceHit(result) then
+		return false
+	end
+
+	local part = result.Instance
+	local height = part.Size.Y
+
+	return height >= JUMP_MIN_OBSTACLE_HEIGHT
+		and height <= JUMP_MAX_OBSTACLE_HEIGHT
+		and math.abs(result.Normal.Y) < 0.65
+end
+
+local function startJump(direction, speed)
+	if direction.Magnitude <= 0.05 then
+		return false
+	end
+
+	local now = os.clock()
+	if isJumping or isClimbing or now - lastJumpTime < JUMP_COOLDOWN then
+		return false
+	end
+
+	lastJumpTime = now
+	isJumping = true
+	jumpStartTime = now
+	jumpDirection = Vector3.new(direction.X, 0, direction.Z).Unit
+	jumpMoveSpeed = speed * JUMP_FORWARD_SPEED_MULTIPLIER
+	jumpGroundGraceUntil = now + JUMP_DURATION + JUMP_GROUND_GRACE
+	avoidancePoint = nil
+	avoidancePointExpiresAt = 0
+	forcePathRecompute = true
+
+	faceTowards(rootCollider.Position + jumpDirection)
+	playJump()
+
+	rootCollider.AssemblyLinearVelocity = Vector3.new(
+		jumpDirection.X * jumpMoveSpeed,
+		JUMP_VERTICAL_SPEED,
+		jumpDirection.Z * jumpMoveSpeed
+	)
+	rootCollider.AssemblyAngularVelocity = Vector3.zero
+
+	return true
+end
+
+local function tryStartJump(direction, speed, forceJump)
+	if direction.Magnitude <= 0.05 then
+		return false
+	end
+
+	if not forceJump then
+		local result = raycastMovementObstacle(direction, JUMP_SCAN_DISTANCE, JUMP_SCAN_HEIGHT)
+		if not isJumpableObstacleHit(result) then
+			return false
+		end
+	end
+
+	return startJump(direction, speed)
+end
+
+local function updateJumpMotion()
+	if not isJumping then
+		return false
+	end
+
+	local elapsed = os.clock() - jumpStartTime
+	local velocity = rootCollider.AssemblyLinearVelocity
+	rootCollider.AssemblyLinearVelocity = Vector3.new(
+		jumpDirection.X * jumpMoveSpeed,
+		velocity.Y,
+		jumpDirection.Z * jumpMoveSpeed
+	)
+
+	if elapsed >= JUMP_DURATION then
+		isJumping = false
+		forcePathRecompute = true
+		lastPathMovePosition = rootCollider.Position
+		lastPathMoveTime = os.clock()
+	end
+
+	return isJumping
+end
+
 --====================================================
 -- НАВИГАЦИЯ PATHFINDING SERVICE
 --====================================================
@@ -1384,6 +1582,7 @@ local currentPath = nil
 local currentWaypoints = {}
 local currentWaypointIndex = 1
 local currentPathTargetPosition = nil
+local currentWaypointAction = nil
 local lastPathComputeTime = -math.huge
 local blockedPathConnection = nil
 forcePathRecompute = true
@@ -1391,14 +1590,15 @@ lastPathMovePosition = rootCollider.Position
 lastPathMoveTime = os.clock()
 local avoidanceSide = 0
 local lastAvoidanceDecisionTime = -math.huge
-local avoidancePoint = nil
-local avoidancePointExpiresAt = 0
+avoidancePoint = nil
+avoidancePointExpiresAt = 0
 
 clearPath = function()
 	currentPath = nil
 	currentWaypoints = {}
 	currentWaypointIndex = 1
 	currentPathTargetPosition = nil
+	currentWaypointAction = nil
 	forcePathRecompute = true
 	lastPathComputeTime = -math.huge
 	avoidanceSide = 0
@@ -1502,12 +1702,14 @@ local function getNextPathWaypoint(targetPosition)
 		local flatWaypoint = Vector3.new(waypoint.Position.X, rootCollider.Position.Y, waypoint.Position.Z)
 
 		if (flatWaypoint - rootCollider.Position).Magnitude > PATH_WAYPOINT_REACHED_DISTANCE then
+			currentWaypointAction = waypoint.Action
 			return waypoint.Position
 		end
 
 		currentWaypointIndex += 1
 	end
 
+	currentWaypointAction = nil
 	return targetPosition
 end
 
@@ -1663,6 +1865,18 @@ local function moveTowards(targetPosition, speed)
 		return
 	end
 
+	if directTargetOffset.Magnitude > 0.1 and tryStartJump(directTargetOffset.Unit, speed, false) then
+		return
+	end
+
+	if currentWaypointAction == Enum.PathWaypointAction.Jump and tryStartJump(desiredDirection, speed, true) then
+		return
+	end
+
+	if tryStartJump(desiredDirection, speed, false) then
+		return
+	end
+
 	local avoidedTargetPosition = getAvoidanceMoveTarget(desiredDirection, flatTarget)
 	local avoidedOffset = avoidedTargetPosition - currentPosition
 
@@ -1767,7 +1981,13 @@ RunService.Heartbeat:Connect(function()
 		return
 	end
 
-	if os.clock() >= climbGroundGraceUntil then
+	if isJumping then
+		updateJumpMotion()
+		return
+	end
+
+	local now = os.clock()
+	if now >= climbGroundGraceUntil and now >= jumpGroundGraceUntil then
 		stabilizeOnGround()
 	else
 		limitUpwardLaunch()
@@ -1855,4 +2075,4 @@ RunService.Heartbeat:Connect(function()
 	playRun()
 end)
 
-print("[PirateUnitAI] Pirate AI with running chase, wide avoidance, and fence climbing loaded. Root:", rootCollider:GetFullName())
+print("[PirateUnitAI] Pirate AI with running chase, smooth turning, jumping, wide avoidance, and fence climbing loaded. Root:", rootCollider:GetFullName())
