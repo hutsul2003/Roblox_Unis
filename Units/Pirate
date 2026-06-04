@@ -33,6 +33,66 @@ local DEBUG_VISIBLE = false
 local MODEL_YAW_OFFSET_DEGREES = 180
 
 --====================================================
+-- РАННЯЯ СБОРКА КОЛЛАЙДЕРОВ
+--====================================================
+-- Если ниже в AI появится ошибка, NPC всё равно не должен «разваливаться»:
+-- сначала прячем BodyColliders и привариваем их к TorsoCollider/визуалу.
+-- Основной физический блок ниже повторно настроит эти weld'ы уже полностью.
+local function bootstrapColliderWelds()
+	local bootstrapBodyColliders = npc:FindFirstChild(BODY_COLLIDERS_NAME)
+	local bootstrapVisualMesh = npc:FindFirstChild(VISUAL_MESH_NAME, true)
+
+	if not bootstrapBodyColliders then
+		return
+	end
+
+	local bootstrapRootCollider = bootstrapBodyColliders:FindFirstChild(ROOT_COLLIDER_NAME, true)
+
+	if not bootstrapRootCollider or not bootstrapRootCollider:IsA("BasePart") then
+		return
+	end
+
+	for _, object in ipairs(npc:GetDescendants()) do
+		if object:IsA("WeldConstraint") then
+			if object.Name == "PirateColliderWeld" or object.Name == "PirateVisualWeld" then
+				object:Destroy()
+			end
+		end
+	end
+
+	for _, object in ipairs(bootstrapBodyColliders:GetDescendants()) do
+		if object:IsA("BasePart") then
+			object.Anchored = false
+			object.CanQuery = true
+			object.Transparency = DEBUG_VISIBLE and 0.45 or 1
+
+			if object ~= bootstrapRootCollider then
+				local weld = Instance.new("WeldConstraint")
+				weld.Name = "PirateColliderWeld"
+				weld.Part0 = bootstrapRootCollider
+				weld.Part1 = object
+				weld.Parent = object
+			end
+		end
+	end
+
+	if bootstrapVisualMesh and bootstrapVisualMesh:IsA("BasePart") then
+		bootstrapVisualMesh.Anchored = false
+		bootstrapVisualMesh.CanCollide = false
+		bootstrapVisualMesh.CanTouch = false
+		bootstrapVisualMesh.Massless = true
+
+		local visualWeld = Instance.new("WeldConstraint")
+		visualWeld.Name = "PirateVisualWeld"
+		visualWeld.Part0 = bootstrapRootCollider
+		visualWeld.Part1 = bootstrapVisualMesh
+		visualWeld.Parent = bootstrapRootCollider
+	end
+end
+
+bootstrapColliderWelds()
+
+--====================================================
 -- НАСТРОЙКИ ИИ
 --====================================================
 
